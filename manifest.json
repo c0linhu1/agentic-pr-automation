@@ -1,0 +1,51 @@
+{
+  "_metadata": {
+    "major_version": 2,
+    "minor_version": 1
+  },
+  "display_information": {
+    "name": "Agent Bench",
+    "description": "Dev bot that routes Slack commands to local open-weight agents"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "agent-bench",
+      "always_online": true
+    },
+    "slash_commands": [
+      {
+        "command": "/agent",
+        "description": "Run an agent on a prompt",
+        "usage_hint": "<agent> <prompt>",
+        "should_escape": false
+      },
+      {
+        "command": "/agents",
+        "description": "List available agents",
+        "should_escape": false
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "chat:write",
+        "commands"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "app_mention"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": true
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}
