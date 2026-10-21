@@ -1,0 +1,127 @@
+# Benchmark cases for bench.py. Each planted case has one known bug; a validator "catches" it
+# when it reports a finding in one of the `expect` categories. The clean case has no bug: any
+# medium-or-worse finding on it counts as a false alarm. Add your own cases here.
+
+cases:
+  - name: sql-injection
+    validator: security
+    expect: [injection]
+    input: |
+      TITLE: Add document search
+      DIFF:
+      --- a/api/search.py
+      +++ b/api/search.py
+      @@ -1,3 +1,8 @@
+      +def search_documents(db, term):
+      +    query = f"SELECT id, title FROM documents WHERE title LIKE '%{term}%'"
+      +    return db.execute(query).fetchall()
+
+  - name: divide-by-zero
+    validator: correctness
+    expect: [edge-case, logic]
+    input: |
+      TITLE: Add average order value
+      DIFF:
+      --- a/src/orders.py
+      +++ b/src/orders.py
+      @@ -10,3 +10,6 @@
+      +def average_order_value(orders):
+      +    total = sum(o.amount for o in orders)
+      +    return total / len(orders)
+
+  - name: claimed-tests-missing
+    validator: correctness
+    expect: [claimed-not-done, misleading]
+    input: |
+      TITLE: Fix crash when customer has no address
+      DESCRIPTION:
+      Adds a None check for missing addresses and adds unit tests for it.
+      DIFF:
+      --- a/src/shipping.py
+      +++ b/src/shipping.py
+      @@ -20,3 +20,5 @@
+      +    if customer.address is None:
+      +        return None
+
+  - name: weak-assertion
+    validator: qa
+    expect: [weak-assertion]
+    input: |
+      TITLE: Add tax calculation
+      DIFF:
+      --- a/src/tax.py
+      +++ b/src/tax.py
+      @@ -1,2 +1,4 @@
+      +def tax(amount, rate):
+      +    return round(amount * rate, 2)
+      --- a/tests/test_tax.py
+      +++ b/tests/test_tax.py
+      @@ -1,2 +1,4 @@
+      +def test_tax():
+      +    assert tax(100, 0.07) is not None
+
+  - name: hardcoded-url
+    validator: architecture
+    expect: [config]
+    input: |
+      TITLE: Add payments client
+      DIFF:
+      --- a/src/payments.py
+      +++ b/src/payments.py
+      @@ -1,2 +1,7 @@
+      +import requests
+      +
+      +def charge(amount, token):
+      +    return requests.post("https://api.prod-payments.example.com/v1/charge",
+      +                         json={"amount": amount, "token": token}, timeout=10)
+
+  - name: pii-to-third-party
+    validator: compliance
+    expect: [data-egress, personal-data]
+    input: |
+      TITLE: Track signups in analytics
+      DIFF:
+      --- a/src/signup.py
+      +++ b/src/signup.py
+      @@ -30,2 +30,6 @@
+      +    analytics.track("signup", {
+      +        "email": user.email,
+      +        "full_name": user.full_name,
+      +        "date_of_birth": user.date_of_birth,
+      +    })
+
+  - name: query-in-loop
+    validator: performance
+    expect: [n-plus-one]
+    input: |
+      TITLE: Monthly report with customer names
+      DIFF:
+      --- a/src/report.py
+      +++ b/src/report.py
+      @@ -5,3 +5,8 @@
+      +def monthly_report(db, orders):
+      +    rows = []
+      +    for order in orders:  # ~50,000 orders per month
+      +        customer = db.execute("SELECT name FROM customers WHERE id = ?", (order.customer_id,)).fetchone()
+      +        rows.append((order.id, customer.name, order.amount))
+      +    return rows
+
+  - name: clean-change
+    validator: all
+    expect: []
+    input: |
+      TITLE: Rename helper for clarity
+      DESCRIPTION:
+      Renames format_amt to format_amount. No behavior change.
+      DIFF:
+      --- a/src/money.py
+      +++ b/src/money.py
+      @@ -1,4 +1,4 @@
+      -def format_amt(cents: int) -> str:
+      +def format_amount(cents: int) -> str:
+           return f"${cents / 100:,.2f}"
+      --- a/src/invoice.py
+      +++ b/src/invoice.py
+      @@ -8,3 +8,3 @@
+      -    line = f"{item.name}: {format_amt(item.cents)}"
+      +    line = f"{item.name}: {format_amount(item.cents)}"

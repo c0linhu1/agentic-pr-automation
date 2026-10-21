@@ -1,5 +1,17 @@
 .env
+.env.vader
+.env.slack
 br/
 .venv/
 __pycache__/
 skills/
+vader_state.json
+vader_state.tmp
+bench_results/
+PROGRESS.md
+slack_bot/manifest.json
+slack_bot/manifest.yaml
+MODEL_FINDINGS.md
+failed_replies/
+vader/__init__.py
+tests/__init__.py

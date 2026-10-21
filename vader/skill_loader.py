@@ -1,8 +1,5 @@
-"""Loads a SKILL.md folder into a system prompt for a plain Ollama chat model.
-
-Coding agents (Claude Code etc.) read references/ on demand. A plain chat
-completion can't open files, so the loader inlines the references and drops the
-"When to Activate" section, which is for dispatch, not for the reviewer."""
+"""Turns a skills/<name>/SKILL.md (plus any references/*.md) into a validator's instructions,
+dropping the "When to Activate" section, which is only for routing."""
 import re
 from dataclasses import dataclass
 from pathlib import Path
