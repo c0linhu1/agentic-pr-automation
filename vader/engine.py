@@ -16,8 +16,9 @@ from typing import Callable
 from . import config, llm, models
 from .agents import VALIDATORS
 from .decision import decide
-from .diffs import FileDiff, filter_files, pack, pack_with_context, split_files
+from .diffs import FileDiff, pack, pack_with_context, split_files
 from .findings import SEVERITIES, VERIFY_SCHEMA, agreed, code_lines, ground, parse_findings
+from .skips import filter_files
 from .state import State
 
 log = logging.getLogger("vader.engine")

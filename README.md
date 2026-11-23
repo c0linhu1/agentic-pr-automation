@@ -363,6 +363,7 @@ true ("doesn't check for zero" and "checks for zero" score as almost identical).
 ```
 vader/       service.py (API)  engine.py (queue)  agents.py (validators)  models.py (one-model rule)
              decision.py (verdict)  github.py (poller, auto-merge)  report.py (PR comment)  state.py  findings.py
+             diffs.py (splitting a diff into parts)  skips.py (files left out, and which skips are safe)
              llm.py  skill_loader.py  config.py
 slack_bot/   bot.py  vader_client.py  fmt.py  manifest.yaml (gitignored)
 skills/      the six SKILL.md files (generic; gitignored)

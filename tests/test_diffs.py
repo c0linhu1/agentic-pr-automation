@@ -2,8 +2,8 @@ import unittest
 from unittest import mock
 
 from vader import config
-from vader.diffs import (filter_files, generated_source_changed, has_generated_banner, needs_person, pack, split_files,
-                         unsafe_skips)
+from vader.diffs import pack, split_files
+from vader.skips import filter_files, generated_source_changed, has_generated_banner, needs_person, unsafe_skips
 
 
 def git_file(path: str, body_lines: int = 3, hunks: int = 1) -> str:

@@ -14,9 +14,9 @@ import httpx
 
 from . import config, models, report
 from .agents import VALIDATORS
-from .diffs import (FileDiff, filter_files, generated_source_changed, has_generated_banner, needs_person,
-                    split_files, unsafe_skips)
+from .diffs import FileDiff, split_files
 from .engine import Engine, Events, Review, Stopped
+from .skips import filter_files, generated_source_changed, has_generated_banner, needs_person, unsafe_skips
 from .state import State
 
 log = logging.getLogger("vader.github")
