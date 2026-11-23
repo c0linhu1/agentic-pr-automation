@@ -1,32 +1,14 @@
-# Models Vader may use (listed, enabled, and pulled). Details and test results: MODEL_FINDINGS.md
+# Models Vader may use (listed, enabled, and pulled).
 
 default: qwen3.6:35b-a3b
 
-#validators:
- # security: qwen3.6:35b-a3b
- # correctness: qwen3.6:35b-a3b
- # qa: qwen3.6:35b-a3b
- # architecture: devstral:24b
- # compliance: gemma3:12b
- # performance: qwen3.6:35b-a3b
+# A validator can run on its own model; the rest use the active one. Uncomment to try, e.g.:
+# validators:
+#   architecture: gpt-oss:20b
 
 models:
-  - {name: llama3.2:3b, tier: test, enabled: true}
-
-  - {name: qwen2.5-coder:7b, tier: baseline, enabled: true}
-  - {name: llama3.1:8b, tier: baseline, enabled: true}
-  - {name: qwen3:8b, tier: baseline, enabled: true}
-  - {name: gemma2:9b, tier: baseline, enabled: true}
-
+  - {name: llama3.2:3b, tier: test, enabled: true, note: "small and fast; for checking the pipeline, not for reviews"}
   - {name: gemma3:12b, tier: mid, enabled: true}
-  - {name: qwen3:14b, tier: mid, enabled: true}
-  - {name: phi4:14b, tier: mid, enabled: true}
-  - {name: qwen2.5-coder:14b, tier: mid, enabled: true}
-  - {name: phi4-reasoning:14b, tier: mid, enabled: true, note: "reasoning model"}
-
   - {name: gpt-oss:20b, tier: large, enabled: true, reasoning_effort: low, note: "reasoning model"}
-  - {name: qwen3.6:35b-a3b, tier: large, enabled: true}
   - {name: devstral:24b, tier: large, enabled: true}
-  - {name: mistral-small3.2:24b, tier: large, enabled: true}
-
-  - {name: gemma3:27b, tier: experimental, enabled: false}
+  - {name: qwen3.6:35b-a3b, tier: large, enabled: true, temperature: 0.6, note: "Qwen's coding setting; near 0 it can think in circles"}

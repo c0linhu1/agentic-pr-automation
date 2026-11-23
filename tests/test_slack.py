@@ -4,7 +4,8 @@ from slack_bot import fmt
 
 
 class SlackTextTests(unittest.TestCase):
-    """Slack sends &, <, and > in message text as &amp;, &lt;, and &gt;, and reads them the same way."""
+    """What the bot posts. Slack sends &, <, and > in message text as &amp;, &lt;, and &gt;, and reads them the
+    same way, so text from a PR or a model is escaped before it's posted."""
 
     def test_pasted_code_gets_its_angle_brackets_and_ampersands_back(self):
         sent = "+    var xs = new List&lt;int&gt;();\n+    if (a &amp;&amp; b) return;\n+    x = \"&amp;lt;\";"
@@ -33,6 +34,43 @@ class SlackTextTests(unittest.TestCase):
             self.assertNotIn("<!channel>", text)
             self.assertNotIn("<https://evil", text)
         self.assertIn("x &amp; y", fmt.validator_result(result))
+
+    def test_merge_and_issue_messages_are_escaped(self):
+        text = fmt.merge("conflict", "`<!channel>` has merge conflicts with `staging`.")
+        self.assertTrue(text.startswith(":x: "))
+        self.assertNotIn("<!channel>", text)
+        text = fmt.issue_closed({"repo": "o/r", "issue": 15, "title": "<!channel> bug", "pr": 16, "merged": True,
+                                 "url": "https://github.com/o/r/issues/15"})
+        self.assertIn("<https://github.com/o/r/issues/15|o/r#15>", text)
+        self.assertIn("PR #16 was merged", text)
+        self.assertNotIn("<!channel>", text)
+
+    def test_findings_dropped_after_the_recheck_are_shown_with_the_reason(self):
+        text = fmt.validator_result({"status": "ok", "findings": [], "seconds": 1, "model": "m", "dropped": 0,
+                                     "rejected": [{"severity": "high", "description": "wrong weekday",
+                                                   "reason": "2028-04-13 is a Thursday"}]})
+        self.assertIn("Dropped after checking (high): wrong weekday", text)
+        self.assertIn("2028-04-13 is a Thursday", text)
+
+
+class StatusTests(unittest.TestCase):
+    BASE = {"enabled": True, "automation": False, "model": "m", "running": None, "queue": [],
+            "github": {"configured": True, "repos": ["o/r"]}}
+
+    def status(self, **changes):
+        return fmt.status(dict(self.BASE, **changes))
+
+    def test_model_server(self):
+        self.assertIn("can't reach the model server at http://lmstudio/v1",
+                      self.status(loaded=None, model_server={"url": "http://lmstudio/v1", "reachable": False}))
+        self.assertIn("Loaded: up to the model server", self.status(loaded=None, model_server={"reachable": True}))
+        self.assertIn("`m` (4.8 GB)", self.status(loaded=[{"name": "m", "size_gb": 4.8}],
+                                                  model_server={"reachable": True}))
+
+    def test_auto_merge_and_issue_closing(self):
+        self.assertIn("Auto-merge: PASS → `staging` · Closing linked issues: on",
+                      self.status(loaded=[], auto_merge="staging", close_issues=True))
+        self.assertIn("Auto-merge: off · Closing linked issues: off", self.status(loaded=[]))
 
 
 if __name__ == "__main__":

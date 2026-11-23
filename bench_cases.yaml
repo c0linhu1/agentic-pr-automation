@@ -1,6 +1,12 @@
 # Benchmark cases for bench.py. Each planted case has one known bug; a validator "catches" it
-# when it reports a finding in one of the `expect` categories. The clean case has no bug: any
-# medium-or-worse finding on it counts as a false alarm. Add your own cases here.
+# when it reports a finding in one of the `expect` categories (and, with `expect_words`, whose
+# description or fix says one of those words; with a list of lists, one word from each; with
+# `min_severity`, at that severity or worse). A case
+# with no planted bug (`expect: []`) counts any finding more severe than `worst_allowed` (default:
+# info, since any low finding already stops an auto-merge) as a false alarm. Add your own cases here.
+#
+# Keep the skills general: a case whose bug a skill describes by name measures whether the model
+# repeats the hint. Cases marked "held out" are bugs no skill describes.
 
 cases:
   - name: sql-injection
@@ -125,3 +131,725 @@ cases:
       @@ -8,3 +8,3 @@
       -    line = f"{item.name}: {format_amt(item.cents)}"
       +    line = f"{item.name}: {format_amount(item.cents)}"
+
+  # A change handler that resets a field fires when the field loses focus, which happens when the user
+  # clicks the submit button: the reset lands just before the form is read, and the typed value is lost.
+  - name: change-event-overwrites-input
+    validator: correctness
+    expect: [logic, edge-case, concurrency, data-integrity]
+    # Judged on the reasoning, not on a hint's words: it must connect the reset to the submit.
+    expect_words: [[submit, placeorder, "order is placed", "order goes out"],
+                   [overwrit, reset, replac, lost, discard, clobber]]
+    input: |
+      TITLE: Reset quantity when switching between case and single-unit items
+      DESCRIPTION:
+      Quantity means cases for bulk items and single units otherwise. When the item type changes
+      (picking an item from the list, or editing the SKU), quantity resets to that type's default:
+      1 case or 12 units. The unit is shown next to the field.
+      DIFF:
+      --- a/web/order-form.ts
+      +++ b/web/order-form.ts
+      @@ -12,6 +12,14 @@ function init(form: HTMLFormElement): void {
+         const quantity = field("quantity");
+         const sku = field("sku");
+      +  const unitLabel = form.querySelector<HTMLElement>("#quantity-unit")!;
+      +
+      +  let bulk = false;
+      +  function setItemKind(isBulk: boolean): void {
+      +    unitLabel.textContent = isBulk ? "(cases)" : "(units)";
+      +    if (isBulk !== bulk) quantity.value = String(isBulk ? 1 : 12);
+      +    bulk = isBulk;
+      +  }
+       
+         function pick(item: string): void {
+           sku.value = item;
+      -    quantity.value = "1";
+      +    setItemKind(isBulkSku(item));
+         }
+      @@ -30,6 +38,7 @@ function init(form: HTMLFormElement): void {
+         for (const input of [sku, quantity]) input.addEventListener("input", scheduleTotal);
+      +  sku.addEventListener("change", () => setItemKind(isBulkSku(sku.value)));
+       
+         form.addEventListener("submit", async (event) => {
+           event.preventDefault();
+           const order = await placeOrder({ sku: sku.value.trim(), quantity: Number(quantity.value) });
+
+  # A bug fix with no regression test, in a layer the repo has no tests for at all (the TESTS line says
+  # so). The gap is worth reporting, but holding the release over it isn't: high is too severe here.
+  - name: missing-test-where-the-layer-has-none
+    validator: qa
+    expect: []
+    worst_allowed: medium
+    input: |
+      TITLE: Fix the unit label showing "(units)" for bulk items
+      DESCRIPTION:
+      The label next to quantity always said "(units)". It now follows the item type. The repo has
+      no browser test harness yet, so this was checked by hand.
+      TESTS: the repo's test files are 41 .py files (tests/api, tests/billing). There are no test files for .ts, which this PR changes.
+      DIFF:
+      --- a/web/order-form.ts
+      +++ b/web/order-form.ts
+      @@ -20,7 +20,7 @@ function setItemKind(isBulk: boolean): void {
+      -  unitLabel.textContent = "(units)";
+      +  unitLabel.textContent = isBulk ? "(cases)" : "(units)";
+
+  # Security: any signed-in user can read any statement by changing the id.
+  - name: statement-by-id-without-owner-check
+    validator: security
+    expect: [authz]
+    input: |
+      TITLE: Download a statement as PDF
+      DIFF:
+      --- a/src/Web/Controllers/StatementsController.cs
+      +++ b/src/Web/Controllers/StatementsController.cs
+      @@ -18,4 +18,14 @@ public class StatementsController : Controller
+           private readonly AppDbContext _db;
+           private readonly IPdfRenderer _pdf;
+      +
+      +    [Authorize]
+      +    [HttpGet("statements/{id:int}/pdf")]
+      +    public async Task<IActionResult> Pdf(int id)
+      +    {
+      +        var statement = await _db.Statements.FindAsync(id);
+      +        if (statement is null) return NotFound();
+      +        return File(_pdf.Render(statement), "application/pdf", $"statement-{id}.pdf");
+      +    }
+
+  - name: api-key-in-frontend-code
+    validator: security
+    expect: [secrets]
+    input: |
+      TITLE: Show live exchange rates on the checkout page
+      DIFF:
+      --- a/web/src/rates.ts
+      +++ b/web/src/rates.ts
+      @@ -0,0 +1,9 @@
+      +const RATES_API_KEY = "fxr_live_7c2e9a41d8b35f60e1a94c27b8d0f3e5";
+      +
+      +export async function getRate(from: string, to: string): Promise<number> {
+      +  const res = await fetch(`https://api.fxrates.example.com/v1/latest?base=${from}&symbols=${to}`, {
+      +    headers: { Authorization: `Bearer ${RATES_API_KEY}` },
+      +  });
+      +  const body = await res.json();
+      +  return body.rates[to];
+      +}
+
+  # Held out. A blur handler starts an async save; clicking Cancel blurs the field first, so the save
+  # can land after the discard and bring the draft back.
+  - name: blur-save-races-cancel
+    validator: correctness
+    expect: [concurrency, logic, data-integrity]
+    expect_words: [[cancel, discard], [save, draft],
+                   [blur, "loses focus", "lose focus", race, "comes back", reappear, resurrect, "out of order",
+                    "in flight", "still pending", "after the delete", "after the discard", "after cancel"]]
+    input: |
+      TITLE: Autosave the note title, and let Cancel throw the draft away
+      DESCRIPTION:
+      The title is saved as a draft whenever the field loses focus. Cancel deletes the draft and closes
+      the editor.
+      DIFF:
+      --- a/web/note-editor.ts
+      +++ b/web/note-editor.ts
+      @@ -8,5 +8,15 @@ export function initEditor(root: HTMLElement, noteId: string): void {
+         const title = root.querySelector<HTMLInputElement>("#title")!;
+         const cancel = root.querySelector<HTMLButtonElement>("#cancel")!;
+      +
+      +  title.addEventListener("blur", async () => {
+      +    await api.put(`/notes/${noteId}/draft`, { title: title.value });
+      +  });
+      +
+      +  cancel.addEventListener("click", async () => {
+      +    await api.delete(`/notes/${noteId}/draft`);
+      +    closeEditor();
+      +  });
+       }
+
+  # Held out. Switching accounts quickly: an older request that resolves last shows the wrong balance.
+  - name: stale-response-overwrites-newer
+    validator: correctness
+    expect: [concurrency, logic, data-integrity, edge-case]
+    expect_words: [[stale, race, "out of order", older, "earlier request", "previous request", slower],
+                   [account, response, request, balance]]
+    input: |
+      TITLE: Show the selected account's balance
+      DIFF:
+      --- a/web/src/BalanceCard.tsx
+      +++ b/web/src/BalanceCard.tsx
+      @@ -1,6 +1,14 @@
+      -export function BalanceCard() {
+      -  return <div className="card">Balance</div>;
+      +export function BalanceCard({ accountId }: { accountId: string }) {
+      +  const [balance, setBalance] = useState<number | null>(null);
+      +
+      +  useEffect(() => {
+      +    setBalance(null);
+      +    fetchBalance(accountId).then((b) => setBalance(b));
+      +  }, [accountId]);
+      +
+      +  return <div className="card">{balance === null ? "Loading" : formatMoney(balance)}</div>;
+       }
+
+  # Held out. Two withdrawals at once both read the balance before the await, so both pass the check.
+  - name: check-then-await-then-write
+    validator: correctness
+    expect: [concurrency, data-integrity, logic]
+    expect_words: [[concurren, race, "same time", simultaneous, interleav, "lost update", "two withdrawals"],
+                   [balance, overdra, "lost update", negative, "more than", stale]]
+    input: |
+      TITLE: Write withdrawals to the audit log
+      DIFF:
+      --- a/wallet/service.py
+      +++ b/wallet/service.py
+      @@ -14,6 +14,7 @@ class Wallet:
+           async def withdraw(self, account_id: str, amount: int) -> int:
+               balance = self.balances[account_id]
+               if balance < amount:
+                   raise InsufficientFunds(account_id)
+      +        await self.audit.record("withdraw", account_id, amount)
+               self.balances[account_id] = balance - amount
+               return balance - amount
+
+  # A test that swallows the exception it means to check: it passes whether or not Refund throws.
+  - name: test-passes-without-the-exception
+    validator: qa
+    expect: [weak-assertion, test-design]
+    input: |
+      TITLE: Reject refunds larger than the amount paid
+      DIFF:
+      --- a/src/Billing/RefundService.cs
+      +++ b/src/Billing/RefundService.cs
+      @@ -22,6 +22,8 @@ public class RefundService
+           public void Refund(int orderId, decimal amount)
+           {
+               var order = _orders.Get(orderId);
+      +        if (amount > order.Paid)
+      +            throw new InvalidOperationException("Refund is larger than the amount paid.");
+               _gateway.Refund(order.PaymentId, amount);
+           }
+      --- a/tests/Billing.Tests/RefundServiceTests.cs
+      +++ b/tests/Billing.Tests/RefundServiceTests.cs
+      @@ -30,3 +30,13 @@ public class RefundServiceTests
+      +
+      +    [Fact]
+      +    public void Refund_larger_than_paid_is_rejected()
+      +    {
+      +        var service = NewService(paid: 100m);
+      +        try { service.Refund(orderId: 7, amount: 500m); }
+      +        catch (InvalidOperationException) { }
+      +        _gateway.DidNotReceive().Refund(Arg.Any<string>(), Arg.Any<decimal>());
+      +    }
+
+  # Timing: the timer can fire at exactly 1000 ms, and isExpired needs strictly more.
+  - name: test-depends-on-real-time
+    validator: qa
+    expect: [flaky]
+    input: |
+      TITLE: Expire sessions after their time to live
+      DIFF:
+      --- a/src/session.ts
+      +++ b/src/session.ts
+      @@ -0,0 +1,6 @@
+      +export function createSession({ ttlMs }: { ttlMs: number }) {
+      +  const created = Date.now();
+      +  return {
+      +    isExpired: () => Date.now() - created > ttlMs,
+      +  };
+      +}
+      --- a/test/session.test.ts
+      +++ b/test/session.test.ts
+      @@ -0,0 +1,7 @@
+      +import { createSession } from "../src/session";
+      +
+      +it("expires the session after its ttl", async () => {
+      +  const session = createSession({ ttlMs: 1000 });
+      +  await new Promise((resolve) => setTimeout(resolve, 1000));
+      +  expect(session.isExpired()).toBe(true);
+      +});
+
+  # Clean but tricky: xUnit's precision argument is decimal places, so this is a correct float check.
+  - name: clean-float-assert-with-precision
+    validator: qa
+    expect: []
+    input: |
+      TITLE: Add a helper for the mid price
+      DIFF:
+      --- a/src/Pricing/Quotes.cs
+      +++ b/src/Pricing/Quotes.cs
+      @@ -10,3 +10,5 @@ public static class Quotes
+      +    public static double Mid(double bid, double ask) => (bid + ask) / 2;
+      +
+      --- a/tests/Pricing.Tests/QuotesTests.cs
+      +++ b/tests/Pricing.Tests/QuotesTests.cs
+      @@ -5,3 +5,13 @@ public class QuotesTests
+      +    [Fact]
+      +    public void Mid_is_halfway_between_bid_and_ask()
+      +    {
+      +        Assert.Equal(100.15, Quotes.Mid(100.1, 100.2), precision: 10);
+      +    }
+      +
+      +    [Theory, InlineData(0, 0, 0), InlineData(-1, 1, 0), InlineData(99.5, 100.5, 100)]
+      +    public void Mid_cases(double bid, double ask, double expected) =>
+      +        Assert.Equal(expected, Quotes.Mid(bid, ask), precision: 10);
+
+  - name: query-in-a-razor-view
+    validator: architecture
+    expect: [layering, coupling]
+    input: |
+      TITLE: Show the open order count in the header
+      DIFF:
+      --- a/src/Web/Views/Shared/_Header.cshtml
+      +++ b/src/Web/Views/Shared/_Header.cshtml
+      @@ -1,4 +1,8 @@
+      +@inject AppDbContext Db
+      +@{
+      +    var openOrders = Db.Orders.Count(o => o.UserId == User.GetUserId() && o.Status == OrderStatus.Open);
+      +}
+       <header class="site-header">
+           <a href="/" class="logo">Home</a>
+      +    <span class="badge">@openOrders open</span>
+       </header>
+
+  - name: reimplements-an-existing-helper
+    validator: architecture
+    expect: [duplication, consistency]
+    input: |
+      TITLE: Show totals on the receipt email
+
+      CONTEXT (the changed files in full, after the change; for reading only):
+      === src/emails/receipt.py ===
+      from src.money import format_amount
+
+
+      def render_order_line(item) -> str:
+          return f"{item.quantity} x {item.name}: {format_amount(item.cents, item.currency)}"
+
+
+      def render_receipt(order) -> str:
+          def money(cents):
+              return "$" + str(cents // 100) + "." + str(cents % 100).zfill(2)
+
+          lines = [f"{item.name}: {money(item.cents)}" for item in order.items]
+          lines.append(f"Total: {money(order.total_cents)}")
+          return "\n".join(lines)
+
+      DIFF:
+      --- a/src/emails/receipt.py
+      +++ b/src/emails/receipt.py
+      @@ -9,3 +9,9 @@ def render_order_line(item) -> str:
+       def render_receipt(order) -> str:
+      -    return ""
+      +    def money(cents):
+      +        return "$" + str(cents // 100) + "." + str(cents % 100).zfill(2)
+      +
+      +    lines = [f"{item.name}: {money(item.cents)}" for item in order.items]
+      +    lines.append(f"Total: {money(order.total_cents)}")
+      +    return "\n".join(lines)
+
+  # Every other admin action records who did it; this one doesn't.
+  - name: admin-delete-without-audit
+    validator: compliance
+    expect: [audit-trail]
+    input: |
+      TITLE: Let admins delete a customer
+
+      CONTEXT (the changed files in full, after the change; for reading only):
+      === src/Admin/AdminCustomersController.cs ===
+      [Authorize(Roles = "Admin")]
+      public class AdminCustomersController : Controller
+      {
+          private readonly ICustomerStore _customers;
+          private readonly IAuditLog _audit;
+
+          [HttpPost("admin/customers/{id:int}/suspend")]
+          public async Task<IActionResult> Suspend(int id)
+          {
+              await _customers.SuspendAsync(id);
+              await _audit.RecordAsync(User.Identity!.Name!, "customer.suspend", id);
+              return Ok();
+          }
+
+          [HttpPost("admin/customers/{id:int}/email")]
+          public async Task<IActionResult> ChangeEmail(int id, string email)
+          {
+              await _customers.ChangeEmailAsync(id, email);
+              await _audit.RecordAsync(User.Identity!.Name!, "customer.email", id);
+              return Ok();
+          }
+
+          [HttpDelete("admin/customers/{id:int}")]
+          public async Task<IActionResult> Delete(int id)
+          {
+              await _customers.DeleteAsync(id);
+              return NoContent();
+          }
+      }
+
+      DIFF:
+      --- a/src/Admin/AdminCustomersController.cs
+      +++ b/src/Admin/AdminCustomersController.cs
+      @@ -40,3 +40,10 @@ public class AdminCustomersController : Controller
+      +
+      +    [HttpDelete("admin/customers/{id:int}")]
+      +    public async Task<IActionResult> Delete(int id)
+      +    {
+      +        await _customers.DeleteAsync(id);
+      +        return NoContent();
+      +    }
+
+  - name: access-log-kept-forever
+    validator: compliance
+    expect: [retention, personal-data]
+    input: |
+      TITLE: Record page views for the traffic dashboard
+      TICKET:
+      Privacy policy: raw access records (IP address, user agent) are kept for at most 30 days.
+      DIFF:
+      --- a/app/middleware.py
+      +++ b/app/middleware.py
+      @@ -1,3 +1,14 @@
+      +from app.db import db
+      +from app.models import PageView
+      +
+      +def record_page_view(request, response):
+      +    db.session.add(PageView(
+      +        path=request.path,
+      +        ip_address=request.remote_addr,
+      +        user_agent=request.headers.get("User-Agent"),
+      +        user_id=getattr(request, "user_id", None),
+      +    ))
+      +    db.session.commit()
+      +    return response
+
+  # Loads every trade into memory to sum one account's.
+  - name: whole-table-into-memory
+    validator: performance
+    expect: [query, memory, io-pattern]
+    input: |
+      TITLE: Show an account's realised profit
+      DIFF:
+      --- a/src/Trading/ProfitService.cs
+      +++ b/src/Trading/ProfitService.cs
+      @@ -12,3 +12,9 @@ public class ProfitService
+      +    // The trades table has about 40 million rows.
+      +    public async Task<decimal> RealisedAsync(int accountId)
+      +    {
+      +        var trades = await _db.Trades.ToListAsync();
+      +        return trades.Where(t => t.AccountId == accountId && t.ClosedAt != null).Sum(t => t.Profit);
+      +    }
+
+  - name: lookup-inside-a-map
+    validator: performance
+    expect: [algorithm]
+    input: |
+      TITLE: Label each holding with its instrument name
+      DIFF:
+      --- a/web/src/holdings.ts
+      +++ b/web/src/holdings.ts
+      @@ -4,3 +4,9 @@
+      +// Large accounts have about 20,000 holdings; the instrument list has about 50,000 entries.
+      +export function labelHoldings(holdings: Holding[], instruments: Instrument[]): LabeledHolding[] {
+      +  return holdings.map((h) => ({
+      +    ...h,
+      +    name: instruments.find((i) => i.id === h.instrumentId)?.name ?? "Unknown",
+      +  }));
+      +}
+
+  # Clean but tricky: dates and weekdays that are all right (2028-04-13 is a Thursday).
+  - name: clean-business-day-maths
+    validator: correctness
+    expect: []
+    input: |
+      TITLE: Settlement date is the next business day
+      DESCRIPTION:
+      Trades settle on the next business day: a Thursday trade (e.g. 2028-04-13) settles on Friday
+      2028-04-14, and a Friday trade settles the following Monday. Holidays are out of scope (ticket 212).
+      DIFF:
+      --- a/src/Trading/Settlement.cs
+      +++ b/src/Trading/Settlement.cs
+      @@ -0,0 +1,14 @@
+      +public static class Settlement
+      +{
+      +    public static DateOnly NextBusinessDay(DateOnly trade)
+      +    {
+      +        var next = trade.AddDays(1);
+      +        while (next.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
+      +            next = next.AddDays(1);
+      +        return next;
+      +    }
+      +}
+      --- a/tests/Trading.Tests/SettlementTests.cs
+      +++ b/tests/Trading.Tests/SettlementTests.cs
+      @@ -0,0 +1,9 @@
+      +public class SettlementTests
+      +{
+      +    [Theory]
+      +    [InlineData("2028-04-13", "2028-04-14")]  // Thursday -> Friday
+      +    [InlineData("2028-04-14", "2028-04-17")]  // Friday -> Monday
+      +    public void Next_business_day(string trade, string expected) =>
+      +        Assert.Equal(DateOnly.Parse(expected), Settlement.NextBusinessDay(DateOnly.Parse(trade)));
+      +}
+
+  # Clean but tricky: looks like SQL built from input, but the value is a bound parameter.
+  - name: clean-parameterised-query
+    validator: security
+    expect: []
+    input: |
+      TITLE: Search customers by email
+      DIFF:
+      --- a/api/src/customers.ts
+      +++ b/api/src/customers.ts
+      @@ -3,3 +3,10 @@ import { pool } from "./db";
+      +
+      +export async function findByEmail(email: string) {
+      +  const sql = "SELECT id, name FROM customers WHERE email = $1 LIMIT 1";
+      +  const { rows } = await pool.query(sql, [email.trim().toLowerCase()]);
+      +  return rows[0] ?? null;
+      +}
+
+  # Held out. The default list is created once and shared by every call that leaves tags out.
+  - name: mutable-default-argument
+    validator: correctness
+    expect: [logic, edge-case, data-integrity]
+    expect_words: [[default, "same list", "one list"], [shared, "every call", "between calls", persist, accumulat, "previous call", "other items", leak]]
+    input: |
+      TITLE: Let callers tag an item while saving it
+      DIFF:
+      --- a/catalog/tags.py
+      +++ b/catalog/tags.py
+      @@ -3,3 +3,8 @@ from catalog import db
+      +
+      +def save_with_tag(item_id: int, tag: str, tags: list[str] = []) -> list[str]:
+      +    tags.append(tag)
+      +    db.save_tags(item_id, tags)
+      +    return tags
+
+  # Not held out: the data-integrity category mentions operations that are wrong if re-run. The provider
+  # retries a webhook that fails, and the credit happens before the step that can fail, so one payment
+  # can be credited several times.
+  - name: webhook-credit-not-safe-to-retry
+    validator: correctness
+    expect: [data-integrity, logic, error-handling, concurrency]
+    expect_words: [[retr, twice, "more than once", duplicate, idempot, replay, redeliver], [credit, wallet, balance, double]]
+    input: |
+      TITLE: Credit the wallet when a card payment succeeds
+      DIFF:
+      --- a/src/Payments/WebhooksController.cs
+      +++ b/src/Payments/WebhooksController.cs
+      @@ -14,3 +14,14 @@ public class WebhooksController : Controller
+      +
+      +    [HttpPost("webhooks/payments")]
+      +    public async Task<IActionResult> Payment([FromBody] PaymentEvent e)
+      +    {
+      +        if (!_signature.IsValid(Request)) return Unauthorized();
+      +        if (e.Type != "payment.succeeded") return Ok();
+      +
+      +        await _wallets.CreditAsync(e.AccountId, e.Amount);
+      +        await _email.SendReceiptAsync(e.AccountId, e.Amount);
+      +        return Ok();
+      +    }
+
+  # The other side of the TESTS rule: the repo tests this kind of code, so a bug fix with no
+  # regression test is still high, not capped at medium.
+  - name: bug-fix-without-test-where-tests-exist
+    validator: qa
+    expect: [missing-tests, untested-path]
+    min_severity: high
+    input: |
+      TITLE: Fix proration when a plan is upgraded mid-month
+      DESCRIPTION:
+      Late-month upgrades gave a zero or negative charge, and December upgrades crashed, because the day
+      count used the next month's length.
+      TESTS: the repo's test files are 124 .py files (tests/billing, tests/api, tests/accounts).
+      DIFF:
+      --- a/src/billing/proration.py
+      +++ b/src/billing/proration.py
+      @@ -18,7 +18,8 @@ def prorated_charge(plan_price: Decimal, upgraded_on: date) -> Decimal:
+      -    days_in_month = calendar.monthrange(upgraded_on.year, upgraded_on.month + 1)[1]
+      +    days_in_month = calendar.monthrange(upgraded_on.year, upgraded_on.month)[1]
+           days_left = days_in_month - upgraded_on.day + 1
+           return (plan_price * days_left / days_in_month).quantize(Decimal("0.01"))
+
+  # The clean partner of the case above: the same fix with its regression tests, so a QA that raises
+  # high on any bug fix shows up here.
+  - name: clean-bug-fix-with-its-test
+    validator: qa
+    expect: []
+    worst_allowed: medium
+    input: |
+      TITLE: Fix proration when a plan is upgraded mid-month
+      DESCRIPTION:
+      Late-month upgrades gave a zero or negative charge, and December upgrades crashed, because the day
+      count used the next month's length. Adds regression tests for both.
+      TESTS: the repo's test files are 124 .py files (tests/billing, tests/api, tests/accounts).
+      DIFF:
+      --- a/src/billing/proration.py
+      +++ b/src/billing/proration.py
+      @@ -18,7 +18,8 @@ def prorated_charge(plan_price: Decimal, upgraded_on: date) -> Decimal:
+      -    days_in_month = calendar.monthrange(upgraded_on.year, upgraded_on.month + 1)[1]
+      +    days_in_month = calendar.monthrange(upgraded_on.year, upgraded_on.month)[1]
+           days_left = days_in_month - upgraded_on.day + 1
+           return (plan_price * days_left / days_in_month).quantize(Decimal("0.01"))
+      --- a/tests/billing/test_proration.py
+      +++ b/tests/billing/test_proration.py
+      @@ -30,3 +30,11 @@ def test_upgrade_on_the_first_charges_the_full_month():
+      +
+      +def test_upgrade_on_the_31st_charges_one_day():
+      +    assert prorated_charge(Decimal("31.00"), date(2028, 1, 31)) == Decimal("1.00")
+      +
+      +
+      +def test_december_upgrade_uses_december():
+      +    assert prorated_charge(Decimal("31.00"), date(2028, 12, 15)) == Decimal("17.00")
+
+  # A "fix" that changes no behaviour: typos in comments and a docstring, an unused import, and a name
+  # the linter flagged. It needs no regression test, and nothing here should stop an auto-merge.
+  - name: clean-typo-and-lint-fix
+    validator: qa
+    expect: []
+    input: |
+      TITLE: Fix typos and lint warnings in invoicing
+      DESCRIPTION:
+      Fixes spelling in comments and a docstring, removes an unused import, and renames a variable
+      the linter flagged (shadowed built-in). No behaviour change.
+      TESTS: the repo's test files are 124 .py files (tests/billing, tests/api, tests/accounts).
+      DIFF:
+      --- a/src/billing/invoices.py
+      +++ b/src/billing/invoices.py
+      @@ -1,6 +1,5 @@
+       from decimal import Decimal
+      -import os
+
+       from billing.models import Invoice
+
+      @@ -20,12 +19,12 @@ from billing.models import Invoice
+       def invoice_total(invoice: Invoice) -> Decimal:
+      -    """Retuns the invoice total, includng tax."""
+      -    sum = Decimal("0")
+      +    """Returns the invoice total, including tax."""
+      +    total = Decimal("0")
+           for line in invoice.lines:
+      -        # add the line amount (allready rounded)
+      -        sum += line.amount
+      -    return sum + invoice.tax
+      +        # add the line amount (already rounded)
+      +        total += line.amount
+      +    return total + invoice.tax
+
+  # Held out. A refund is converted at today's exchange rate, not the rate the charge was made at, so
+  # the customer gets back a different amount than they paid and the ledger no longer balances.
+  - name: refund-at-todays-exchange-rate
+    validator: correctness
+    expect: [logic, data-integrity]
+    expect_words: [[rate, exchange, fx], [today, current, "original", "at the time", "when the charge",
+                                          "was charged", "charge's", "historical", "different amount", "changed since"]]
+    input: |
+      TITLE: Support refunds for charges made in other currencies
+      DESCRIPTION:
+      Customers can pay in EUR or GBP; we settle in USD. This adds refunds for those charges.
+      DIFF:
+      --- a/payments/refunds.py
+      +++ b/payments/refunds.py
+      @@ -1,9 +1,22 @@
+       from dataclasses import dataclass
+      +from payments import fx, gateway, ledger
+
+
+       @dataclass
+       class Charge:
+           id: str
+           currency: str         # what the customer paid in
+           amount: int           # in that currency's minor units
+           usd_amount: int       # what we settled, in cents
+           fx_rate: float        # the rate used when the charge was made
+      +
+      +
+      +def refund(charge: Charge, amount: int) -> int:
+      +    """Refunds `amount` (in the charge's currency) and returns the USD cents refunded."""
+      +    if amount > charge.amount:
+      +        raise ValueError("refund is larger than the charge")
+      +    usd = round(amount * fx.rate(charge.currency, "USD"))
+      +    gateway.refund(charge.id, usd)
+      +    ledger.post("refund", charge.id, -usd)
+      +    return usd
+
+  # Held out. Age from the year alone: anyone whose birthday hasn't come yet this year is a year too old,
+  # so a 17-year-old can open an account.
+  - name: age-from-the-year-only
+    validator: correctness
+    expect: [logic, edge-case]
+    expect_words: [birthday, "not yet", "hasn't had", "has not had", "hasn't happened", "off by one", "one year too",
+                   "a year too", "month and day", "later in the year", "17"]
+    input: |
+      TITLE: Block account opening for under-18s
+      DESCRIPTION:
+      Regulators require account holders to be 18 or older. Sign-up now checks the date of birth.
+      DIFF:
+      --- a/web/src/signup/age.ts
+      +++ b/web/src/signup/age.ts
+      @@ -0,0 +1,9 @@
+      +export function ageOn(birthDate: Date, today: Date): number {
+      +  return today.getFullYear() - birthDate.getFullYear();
+      +}
+      +
+      +export const MINIMUM_AGE = 18;
+      +
+      +export function canOpenAccount(birthDate: Date, today = new Date()): boolean {
+      +  return ageOn(birthDate, today) >= MINIMUM_AGE;
+      +}
+
+  # Held out. The fee is configured as a percentage (2.9 means 2.9%) but multiplied in as a fraction, so
+  # every card payment is charged a 290% fee.
+  - name: percent-used-as-a-fraction
+    validator: correctness
+    expect: [logic, data-integrity]
+    expect_words: ["/ 100", "/100", "100 times", "hundred", "290", "fraction", "0.029", "2.9 times", "times the amount",
+                   "more than the payment", "larger than the payment"]
+    input: |
+      TITLE: Pass the card processing fee on to the customer
+      DIFF:
+      --- a/src/Checkout/appsettings.json
+      +++ b/src/Checkout/appsettings.json
+      @@ -4,5 +4,8 @@
+         "Checkout": {
+      -    "Currency": "USD"
+      +    "Currency": "USD",
+      +    "CardFeePercent": 2.9
+         }
+      --- a/src/Checkout/FeeCalculator.cs
+      +++ b/src/Checkout/FeeCalculator.cs
+      @@ -0,0 +1,12 @@
+      +public class FeeCalculator
+      +{
+      +    private readonly CheckoutOptions _options;
+      +
+      +    public FeeCalculator(IOptions<CheckoutOptions> options) => _options = options.Value;
+      +
+      +    // The fee the customer pays on top of the order total, rounded to the cent.
+      +    public decimal CardFee(decimal orderTotal) =>
+      +        Math.Round(orderTotal * _options.CardFeePercent, 2, MidpointRounding.AwayFromZero);
+      +}
+
+  # Held out. Each billing date is a month after the last one, so a customer who signed up on the 31st
+  # is billed on the 28th from February on and never goes back to the 31st.
+  - name: billing-day-drifts-after-a-short-month
+    validator: correctness
+    expect: [logic, edge-case]
+    expect_words: [[drift, "28th", "29th", "30th", "stays on", "stuck", "never goes back", "never returns",
+                    "shifts", "creeps", "moves earlier", "every month after"],
+                   ["31", "signup", "sign-up", "original day", "anchor", "short month", "february"]]
+    input: |
+      TITLE: Bill subscriptions monthly on the day the customer signed up
+      DESCRIPTION:
+      Each customer is billed on the same day of the month as their signup date, or the month's last day
+      when that month is shorter.
+      DIFF:
+      --- a/billing/schedule.py
+      +++ b/billing/schedule.py
+      @@ -1,4 +1,11 @@
+       from datetime import date
+      +
+      +from dateutil.relativedelta import relativedelta
+      +
+      +
+      +def next_billing_date(last_billed: date) -> date:
+      +    """The next date this subscription is billed: one month after the last bill."""
+      +    return last_billed + relativedelta(months=1)

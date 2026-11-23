@@ -20,8 +20,6 @@ from slack_sdk.errors import SlackApiError  # noqa: E402
 from slack_bot import fmt  # noqa: E402
 from slack_bot.vader_client import VaderClient, VaderError, VaderUnavailable  # noqa: E402
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logging.getLogger("httpx").setLevel(logging.WARNING)  # the event poll every 2s would flood the log
 log = logging.getLogger("slack_bot")
 
 NOTIFY_CHANNEL = os.getenv("SLACK_NOTIFY_CHANNEL", "")  # channel ID for automatic PR reviews and alerts
@@ -186,6 +184,10 @@ def handle_event(e: dict) -> None:
             vader.set_reply_to(review["id"], reply_to)
     elif kind == "pr_comment_posted":
         post(reply_to, f":speech_balloon: Posted the report on the PR: <{e['url']}|view comment>")
+    elif kind == "pr_merge":
+        # Merges and conflicts also go to the channel: one changes the branch, the other needs someone to act.
+        post(reply_to, fmt.merge(e["status"], e["message"]),
+             reply_broadcast=bool(reply_to and reply_to.get("thread_ts")) and e["status"] in ("merged", "conflict"))
     elif kind == "pr_comment_failed":
         post(reply_to, f":warning: Couldn't comment on the PR: {fmt.esc(e['error'])}")
     elif kind == "review_started":
@@ -202,7 +204,9 @@ def handle_event(e: dict) -> None:
         post(model_reply_to, f":white_check_mark: Model `{e['model']}` is loaded and ready.")
     elif kind == "model_failed":
         post(model_reply_to, f":x: Model `{e['model']}` failed to load: {fmt.esc(e['error'])}")
-    elif kind == "poller_error":
+    elif kind == "issue_closed":
+        post(None, fmt.issue_closed(e))
+    elif kind in ("poller_error", "issue_close_failed"):
         post(None, f":warning: {fmt.esc(e['message'])}")
 
 
@@ -234,6 +238,8 @@ def event_loop() -> None:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # the event poll every 2s would flood the log
     try:
         s = vader.status()
         log.info("connected to Vader: %s, model %s", "running" if s["enabled"] else "stopped", s["model"])

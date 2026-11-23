@@ -1,13 +1,14 @@
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from fastapi.testclient import TestClient
 
+from tests.helpers import wait_for
 from vader import config
 from vader.engine import Engine, Events, Review
+from vader.github import parse_pr_ref
 from vader.service import create_app
 from vader.state import State
 
@@ -23,16 +24,14 @@ class ServiceTests(unittest.TestCase):
                              prepare_model=lambda m: None, assignments=dict)
         app = create_app(self.state, self.events, self.engine, poller=None, api_key="test-key")
         self.client = TestClient(app).__enter__()
-        patcher = mock.patch("vader.service.models.loaded", return_value=[])
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for patcher in [mock.patch("vader.service.models.loaded", return_value=[]),
+                        mock.patch("vader.service.models.available", return_value={"fake:1b"})]:
+            self.enterContext(patcher)
 
     def tearDown(self):
         self.client.__exit__(None, None, None)
         # A review still finishing would save state.json while the folder is being deleted.
-        end = time.time() + 5
-        while (self.engine.busy or self.engine.status()["queue"]) and time.time() < end:
-            time.sleep(0.02)
+        wait_for(lambda: not (self.engine.busy or self.engine.status()["queue"]))
         self.tmp.cleanup()
 
     def test_requests_without_the_key_are_refused(self):
@@ -53,10 +52,8 @@ class ServiceTests(unittest.TestCase):
         r = self.client.post("/reviews", json={"text": "TITLE: t\nDIFF:\n+x", "validators": ["logic"]}, headers=KEY)
         self.assertEqual(r.status_code, 200)
         review_id = r.json()["id"]
-        for _ in range(100):
-            if self.client.get(f"/reviews/{review_id}", headers=KEY).json()["status"] == "done":
-                break
-            time.sleep(0.02)
+        status = lambda: self.client.get(f"/reviews/{review_id}", headers=KEY).json()["status"]  # noqa: E731
+        self.assertTrue(wait_for(lambda: status() == "done"))
         review = self.client.get(f"/reviews/{review_id}", headers=KEY).json()
         self.assertEqual(review["validators"], ["correctness"])
         self.assertEqual(review["verdict"], "PASS")
@@ -72,7 +69,7 @@ class ServiceTests(unittest.TestCase):
     def test_pr_review_fetches_through_vader(self):
         fake_poller = mock.Mock()
         fake_poller.review_for_pr.return_value = Review(
-            source="github", validators=[], title="Validate trade dates", diff="+x",
+            source="github", validators=[], title="Add order search", diff="+x",
             meta={"repo": "o/r", "number": 8, "url": "https://github.com/o/r/pull/8", "author": "me",
                   "pr_key": "o/r#8", "sha": "abc"})
         app = create_app(self.state, self.events, self.engine, poller=fake_poller, api_key="test-key",
@@ -84,7 +81,7 @@ class ServiceTests(unittest.TestCase):
         fake_poller.review_for_pr.assert_called_once_with("o/r", 8)
         review = self.engine.get(r.json()["id"])
         self.assertEqual(review.validators, ["qa"])
-        self.assertEqual(r.json()["title"], "Validate trade dates")
+        self.assertEqual(r.json()["title"], "Add order search")
 
     def test_pr_review_needs_github(self):
         with mock.patch.object(config, "GITHUB_TOKEN", ""):
@@ -97,9 +94,47 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
         with mock.patch("vader.service.models.check_selectable", return_value=None), \
              mock.patch("vader.service.models.ensure_only"):
-            r = self.client.post("/model", json={"name": "llama3.1:8b"}, headers=KEY)
-        self.assertEqual(r.json()["model"], "llama3.1:8b")
-        self.assertEqual(self.state.model, "llama3.1:8b")
+            r = self.client.post("/model", json={"name": "gpt-oss:20b"}, headers=KEY)
+            self.assertEqual(r.json()["model"], "gpt-oss:20b")
+            self.assertEqual(self.state.model, "gpt-oss:20b")
+            self.engine._running = Review(source="slack", validators=["qa"])  # a review in progress
+            r = self.client.post("/model", json={"name": "fake:1b"}, headers=KEY)
+            self.engine._running = None
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(self.state.model, "gpt-oss:20b")
+
+    def test_the_slack_bots_other_endpoints(self):
+        r = self.client.post("/automation", json={"enabled": True}, headers=KEY).json()
+        self.assertEqual((r, self.state.automation), ({"automation": True, "github_configured": False}, True))
+        self.assertEqual(self.client.post("/control", json={"action": "pause"}, headers=KEY).status_code, 400)
+        with mock.patch("vader.service.models.catalog", return_value=("fake:1b", [])), \
+             mock.patch("vader.service.models.assignments", return_value={"qa": "other:1b"}):
+            m = self.client.get("/models", headers=KEY).json()
+        self.assertEqual((m["active"], m["validators"]["qa"], m["validators"]["security"]),
+                         ("fake:1b", "other:1b", "fake:1b"))
+        # Where an automatic review's results go, once the bot has posted its Slack thread.
+        review = Review(source="github", validators=["qa"])
+        self.engine._reviews[review.id] = review
+        thread = {"channel": "C1", "thread_ts": "1.2"}
+        self.client.post(f"/reviews/{review.id}/reply-to", json={"reply_to": thread}, headers=KEY)
+        self.assertEqual(review.reply_to, thread)
+        self.assertEqual(self.client.post("/reviews/nope/reply-to", json={"reply_to": thread},
+                                          headers=KEY).status_code, 404)
+
+
+class PrRefTests(unittest.TestCase):
+    def test_forms(self):
+        self.assertEqual(parse_pr_ref("11", "o/r"), ("o/r", 11))
+        self.assertEqual(parse_pr_ref("#11", "o/r"), ("o/r", 11))
+        self.assertEqual(parse_pr_ref("x/y#4", "o/r"), ("x/y", 4))
+        self.assertEqual(parse_pr_ref("<https://github.com/owner/repo/pull/9>", None),
+                         ("owner/repo", 9))
+
+    def test_bad_refs(self):
+        with self.assertRaises(ValueError):
+            parse_pr_ref("eleven", "o/r")
+        with self.assertRaises(ValueError):
+            parse_pr_ref("11", None)
 
 
 if __name__ == "__main__":
