@@ -8,7 +8,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(ROOT / ".env.vader")
+# Another settings file, or empty to read none (the tests use only their own settings).
+_env_file = os.getenv("VADER_ENV_FILE", str(ROOT / ".env.vader"))
+if _env_file:
+    load_dotenv(_env_file)
 
 
 def _env(name: str, default: str = "") -> str:

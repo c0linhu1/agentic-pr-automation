@@ -4,7 +4,7 @@
 br/
 .venv/
 __pycache__/
-skills/
+/skills/
 vader_state.json
 vader_state.tmp
 bench_results/

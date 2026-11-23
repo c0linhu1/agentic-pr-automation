@@ -246,6 +246,7 @@ models (`qwen3.6:35b-a3b`) handle that best. Check with `ollama ps` while a mode
 use it. With part of the model on the CPU, give each validator time: `LLM_TIMEOUT_SECONDS=600`.
 
 ### 4. Run
+Needs Python 3.11 or later.
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate
@@ -297,8 +298,9 @@ Run it on the machine Vader will use: speed depends on the hardware, catch rates
 ```powershell
 python -m unittest discover -s tests -t .
 ```
-They use a fake model, clock, and GitHub, so they run without a model server, Slack, or network.
-`tests/helpers.py` lists which file covers which area.
+They use a fake model, clock, and GitHub, so they run without a model server, Slack, or network. They
+also use their own settings and the fake skills in `tests/fixtures/skills`, never `.env.vader` or
+`skills/`, so they pass the same in a fresh clone as on a configured machine.
 
 ## How the models' output is checked
 
