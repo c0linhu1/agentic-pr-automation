@@ -1,5 +1,5 @@
 """The Slack bot's only way to reach Vader: its HTTP API on localhost.
-The bot has no GitHub token and no Ollama address; everything goes through Vader."""
+The bot has no GitHub token and no model server address; everything goes through Vader."""
 import httpx
 
 

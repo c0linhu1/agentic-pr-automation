@@ -1,0 +1,476 @@
+cases:
+  - name: blind-01
+    validator: correctness
+    note: "The idempotency key is generated inside the retry loop (idgen.New() on every attempt). If an attempt times out after the gateway actually captured, the retry carries a new key, so the gateway captures again and the customer is charged twice. The key must be created once per payment, before the loop (or derived from the payment id)."
+    expect: [data-integrity, concurrency, logic]
+    expect_words: [["idempoten", "idgen", "dedup", "de-dup"], ["each attempt", "every attempt", "per attempt", "each retry", "every retry", "per retry", "new key", "fresh key", "different key", "unique key", "inside the loop", "in the loop", "within the loop", "regenerat", "same key", "stable", "reuse", "double", "twice", "duplicate"]]
+    min_severity: medium
+    input: |
+      TITLE: Retry payment captures on transient gateway failures
+      TICKET:
+      PAY-318: Captures fail when the gateway times out, even though most of them
+      would go through on a second try. Retry captures on timeouts and 5xx
+      responses, up to 3 attempts with backoff. A customer must never be charged
+      twice for the same payment.
+      DESCRIPTION:
+      Wraps Service.Capture in a retry loop (3 attempts, linear backoff, honours
+      context cancellation). Only errors that gateway.IsRetryable reports as
+      transient are retried; declines and validation errors return immediately.
+      Every capture request now carries an idempotency key, so the gateway
+      de-duplicates retried requests.
+      DIFF:
+      --- a/payments/capture.go
+      +++ b/payments/capture.go
+      @@ -1,7 +1,16 @@
+       package payments
+       
+       import (
+           "context"
+      +    "fmt"
+      +    "time"
+       
+           "ledgerline/internal/gateway"
+      +    "ledgerline/internal/idgen"
+       )
+      +
+      +const maxCaptureAttempts = 3
+      +
+      +func captureBackoff(attempt int) time.Duration {
+      +    return time.Duration(attempt) * 500 * time.Millisecond
+      +}
+      @@ -40,7 +49,26 @@ func NewService(gw gateway.Client) *Service {
+      -// Capture captures an authorised payment.
+      +// Capture captures an authorised payment, retrying transient gateway failures.
+       func (s *Service) Capture(ctx context.Context, paymentID string, amountCents int64) (*Capture, error) {
+      -    return s.gateway.Capture(ctx, gateway.CaptureRequest{
+      -        PaymentID:   paymentID,
+      -        AmountCents: amountCents,
+      -    })
+      +    var lastErr error
+      +    for attempt := 0; attempt < maxCaptureAttempts; attempt++ {
+      +        if attempt > 0 {
+      +            select {
+      +            case <-ctx.Done():
+      +                return nil, ctx.Err()
+      +            case <-time.After(captureBackoff(attempt)):
+      +            }
+      +        }
+      +        capture, err := s.gateway.Capture(ctx, gateway.CaptureRequest{
+      +            PaymentID:      paymentID,
+      +            AmountCents:    amountCents,
+      +            IdempotencyKey: idgen.New(),
+      +        })
+      +        if err == nil {
+      +            return capture, nil
+      +        }
+      +        if !gateway.IsRetryable(err) {
+      +            return nil, err
+      +        }
+      +        lastErr = err
+      +    }
+      +    return nil, fmt.Errorf("capture %s: giving up after %d attempts: %w", paymentID, maxCaptureAttempts, lastErr)
+       }
+
+  - name: blind-02
+    validator: correctness
+    note: "Clean. Correct version of the downgrade proration: the credit is the price difference times the days remaining in the period (period_end - today) over the period length, rounded down, recorded in the same transaction as the plan switch."
+    expect: []
+    input: |
+      TITLE: Credit customers for mid-period plan downgrades
+      TICKET:
+      BILL-207: When a customer switches to a cheaper plan part-way through a
+      billing period, credit their account with the price difference for the
+      unused part of the current period, prorated by day and rounded down to the
+      cent. A billing period runs from period_start up to, but not including,
+      period_end. Upgrades are out of scope (BILL-212).
+      DESCRIPTION:
+      Adds downgrade_credit_cents and records the credit in the same transaction
+      as the plan switch. change_plan now raises ValueError when the change date
+      is outside the current billing period, since the proration is undefined
+      there. Upgrades still switch plan with no credit, as before.
+      DIFF:
+      --- a/billing/plan_change.py
+      +++ b/billing/plan_change.py
+      @@ -1,11 +1,28 @@
+      +from datetime import date
+      +
+       from billing.db import transaction
+       from billing.ledger import Ledger
+       from billing.models import Plan, Subscription
+       
+       
+      -def change_plan(sub, new_plan, today, ledger):
+      +def downgrade_credit_cents(sub: Subscription, new_plan: Plan, today: date) -> int:
+      +    """Credit owed for the price difference over the rest of the period."""
+      +    if not (sub.period_start <= today < sub.period_end):
+      +        raise ValueError("plan change date is outside the current billing period")
+      +    price_diff = sub.plan.price_cents - new_plan.price_cents
+      +    if price_diff <= 0:
+      +        return 0
+      +    period_days = (sub.period_end - sub.period_start).days
+      +    remaining_days = (sub.period_end - today).days
+      +    return price_diff * remaining_days // period_days
+      +
+      +
+      +def change_plan(sub: Subscription, new_plan: Plan, today: date, ledger: Ledger) -> None:
+           if new_plan.id == sub.plan.id:
+               return
+      +    credit = downgrade_credit_cents(sub, new_plan, today)
+           with transaction():
+      +        if credit:
+      +            ledger.add_credit(sub.customer_id, credit, reason="downgrade proration")
+               sub.plan = new_plan
+               sub.save()
+
+  - name: blind-03
+    validator: correctness
+    note: "The replacement reminder is computed from appt.startsAt, the appointment's old start time loaded before the update, instead of newStart. The reminder still fires 24h before the original slot, not the new one."
+    expect: [logic, acceptance-criteria, data-integrity]
+    expect_words: [["remind", "remindat"], ["appt.startsat", "old start", "old time", "old appointment", "old slot", "original", "previous", "stale", "existing start", "current start", "instead of newstart", "rather than newstart", "not newstart", "use newstart", "not the new", "before the update", "pre-update"]]
+    min_severity: medium
+    input: |
+      TITLE: Move appointment reminders when an appointment is rescheduled
+      TICKET:
+      SCH-91: When a client reschedules, their reminder must move with the
+      appointment: cancel the pending reminder and send the new one 24 hours
+      before the new start time.
+      DESCRIPTION:
+      rescheduleAppointment now takes the reminder queue. It cancels the pending
+      reminder job (if there is one), schedules a replacement 24h ahead and stores
+      the new job id with the appointment. ReminderQueue.schedule already sends
+      straight away when the time is in the past, so short-notice reschedules
+      still get a reminder. The route is updated for the new parameter.
+      DIFF:
+      --- a/src/appointments/reschedule.ts
+      +++ b/src/appointments/reschedule.ts
+      @@ -1,9 +1,19 @@
+       import { AppointmentRepo } from "./repo";
+      +import { ReminderQueue } from "../reminders/queue";
+       
+      +const REMINDER_LEAD_MS = 24 * 60 * 60 * 1000;
+      +
+       export async function rescheduleAppointment(
+         repo: AppointmentRepo,
+      +  reminders: ReminderQueue,
+         id: string,
+         newStart: Date,
+       ): Promise<void> {
+      -  await repo.update(id, { startsAt: newStart });
+      +  const appt = await repo.get(id);
+      +  if (appt.reminderJobId) {
+      +    await reminders.cancel(appt.reminderJobId);
+      +  }
+      +  const remindAt = new Date(appt.startsAt.getTime() - REMINDER_LEAD_MS);
+      +  const reminderJobId = await reminders.schedule(appt.id, remindAt);
+      +  await repo.update(id, { startsAt: newStart, reminderJobId });
+       }
+      --- a/src/appointments/routes.ts
+      +++ b/src/appointments/routes.ts
+      @@ -18,7 +18,7 @@ router.post("/appointments/:id/reschedule", async (req, res) => {
+         const newStart = parseIsoDate(req.body.startsAt);
+         if (!newStart) {
+           return res.status(400).json({ error: "startsAt must be an ISO-8601 timestamp" });
+         }
+      -  await rescheduleAppointment(repo, req.params.id, newStart);
+      +  await rescheduleAppointment(repo, reminders, req.params.id, newStart);
+         return res.status(204).end();
+       });
+
+  - name: blind-04
+    validator: correctness
+    note: "canDelete returns true for any user whose org role is OWNER without checking that the project belongs to that user's organisation, so an owner of one organisation can delete projects in every other organisation. The ticket limits owners to projects in their own organisation; it needs a project.getOrgId() vs user.getOrgId() check."
+    expect: [logic, acceptance-criteria, weakened-check]
+    expect_words: [["org", "tenant"], ["other", "another", "any project", "different", "cross", "every project", "all projects", "regardless", "not check", "doesn't check", "does not check", "without check", "never check", "missing", "getorgid", "same org", "own org", "their org", "belongs"]]
+    min_severity: medium
+    input: |
+      TITLE: Restrict project deletion to project admins and org owners
+      TICKET:
+      PRJ-140: Only project admins should be able to delete a project; today any
+      member can. Organisation owners can delete any project in their own
+      organisation. Everyone else gets 403. (Each user belongs to exactly one
+      organisation; User.getOrgRole() is their role in it.)
+      DESCRIPTION:
+      Adds ProjectPermissions.canDelete (org owner, or admin of the project) and
+      uses it on the delete endpoint instead of canEdit, so plain members can no
+      longer delete projects.
+      DIFF:
+      --- a/src/main/java/com/quillstack/projects/ProjectPermissions.java
+      +++ b/src/main/java/com/quillstack/projects/ProjectPermissions.java
+      @@ -1,13 +1,23 @@
+       package com.quillstack.projects;
+       
+      +import com.quillstack.accounts.OrgRole;
+       import com.quillstack.accounts.User;
+       
+       public final class ProjectPermissions {
+       
+           private ProjectPermissions() {
+           }
+       
+           public static boolean canEdit(User user, Project project) {
+               return project.hasMember(user.getId());
+           }
+      +
+      +    public static boolean canDelete(User user, Project project) {
+      +        if (user.getOrgRole() == OrgRole.OWNER) {
+      +            return true;
+      +        }
+      +        return project.getMemberRole(user.getId())
+      +            .map(role -> role == ProjectRole.ADMIN)
+      +            .orElse(false);
+      +    }
+       }
+      --- a/src/main/java/com/quillstack/projects/ProjectController.java
+      +++ b/src/main/java/com/quillstack/projects/ProjectController.java
+      @@ -48,7 +48,7 @@ public final class ProjectController {
+           public Response delete(RequestContext ctx, long projectId) {
+               User user = ctx.currentUser();
+               Project project = projects.findById(projectId).orElseThrow(ProjectNotFoundException::new);
+      -        if (!ProjectPermissions.canEdit(user, project)) {
+      +        if (!ProjectPermissions.canDelete(user, project)) {
+                   return Response.forbidden();
+               }
+               projects.delete(project);
+
+  - name: blind-05
+    validator: correctness
+    note: "rate_for selects the latest rate effective on or before CURRENT_DATE, the day the nightly job runs, instead of the invoice date. Invoices generated in the days after a rate change for a period before it (and any regenerated older invoice) get the new rate. The ticket says the rate in effect on the invoice date, so rate_for needs the invoice date as a parameter."
+    expect: [logic, acceptance-criteria, edge-case, claimed-not-done]
+    expect_words: [["current_date", "current date", "today", "now", "run time", "runtime", "generat", "at the time", "wall clock", "wall-clock", "when the invoice", "when the job"], ["invoice date", "invoice_date", "invoice's date", "issue date", "billing period", "period end", "end of the period", "date of the invoice", "invoice is dated", "invoiced period"]]
+    min_severity: medium
+    input: |
+      TITLE: Support scheduled tax rate changes
+      TICKET:
+      TAX-55: Finance wants to load next year's tax rates ahead of time. Keep a
+      history of rates per region with the date each one takes effect. An invoice
+      is taxed at the rate in effect on its invoice date (the last day of the
+      billing period). Invoices are produced by a nightly job up to 5 days after
+      the period ends.
+      DESCRIPTION:
+      The migration adds effective_from to tax_rates (existing rows backfilled to
+      2000-01-01) and replaces the one-rate-per-region unique key with
+      (region, effective_from). rate_for now returns the most recent rate that has
+      already taken effect, so rates loaded for a future date are ignored until
+      that date arrives.
+      DIFF:
+      --- /dev/null
+      +++ b/migrations/0042_tax_rate_history.sql
+      @@ -0,0 +1,6 @@
+      +-- Keep the history of tax rates so future changes can be loaded ahead of time.
+      +ALTER TABLE tax_rates ADD COLUMN effective_from DATE;
+      +UPDATE tax_rates SET effective_from = DATE '2000-01-01';
+      +ALTER TABLE tax_rates ALTER COLUMN effective_from SET NOT NULL;
+      +ALTER TABLE tax_rates DROP CONSTRAINT tax_rates_region_key;
+      +ALTER TABLE tax_rates ADD CONSTRAINT tax_rates_region_effective_key UNIQUE (region, effective_from);
+      --- a/invoicing/tax.py
+      +++ b/invoicing/tax.py
+      @@ -10,8 +10,10 @@ from invoicing.errors import UnknownRegion
+       def rate_for(conn, region):
+           row = conn.execute(
+      -        "SELECT rate_bp FROM tax_rates WHERE region = %s",
+      +        "SELECT rate_bp FROM tax_rates"
+      +        " WHERE region = %s AND effective_from <= CURRENT_DATE"
+      +        " ORDER BY effective_from DESC LIMIT 1",
+               (region,),
+           ).fetchone()
+           if row is None:
+               raise UnknownRegion(region)
+           return row[0]
+
+  - name: blind-06
+    validator: correctness
+    note: "TryReserve only increments Reserved and never takes units out of OnHand (Ship does that), so releasing a reservation should only decrement Reserved. Adding the quantity back to OnHand inflates the physical count by the cancelled quantity on every cancellation, creating phantom stock that can be oversold."
+    expect: [logic, data-integrity]
+    expect_words: [["onhand", "on hand", "on-hand", "physical"], ["inflat", "overstat", "overcount", "over-count", "phantom", "double", "twice", "increment", "increas", "adds", "adding", "added", "+=", "should not", "shouldn't", "never decrement", "not decrement", "never reduce", "not reduce", "only reserved", "only the reserved", "only decrement"]]
+    min_severity: medium
+    input: |
+      TITLE: Release reserved stock when an order is cancelled
+      TICKET:
+      INV-77: When an order is cancelled before it ships, the units reserved for
+      it must become available to sell again.
+      DESCRIPTION:
+      Adds StockService.ReleaseReservation, which the order cancellation handler
+      (already merged behind the cancel-release flag) calls once per unshipped
+      line. It rejects a release larger than what is currently reserved.
+      DIFF:
+      --- a/src/Inventory/StockService.cs
+      +++ b/src/Inventory/StockService.cs
+      @@ -32,5 +32,17 @@ public sealed class StockService
+               item.Reserved -= quantity;
+               item.OnHand -= quantity;
+               _stock.Save(item);
+           }
+      +
+      +    public void ReleaseReservation(string sku, int quantity)
+      +    {
+      +        var item = _stock.GetForUpdate(sku);
+      +        if (quantity <= 0 || quantity > item.Reserved)
+      +        {
+      +            throw new ArgumentOutOfRangeException(nameof(quantity));
+      +        }
+      +        item.Reserved -= quantity;
+      +        item.OnHand += quantity;
+      +        _stock.Save(item);
+      +    }
+       }
+
+      CONTEXT (the changed files in full, after the change; for reading only):
+      === src/Inventory/StockService.cs ===
+      using Inventory.Core.Data;
+
+      namespace Inventory.Core;
+
+      public sealed class StockService
+      {
+          private readonly IStockRepository _stock;
+
+          public StockService(IStockRepository stock)
+          {
+              _stock = stock;
+          }
+
+          // OnHand is the physical count in the warehouse; Reserved is the part promised to open orders.
+          public int Available(StockItem item) => item.OnHand - item.Reserved;
+
+          public bool TryReserve(string sku, int quantity)
+          {
+              var item = _stock.GetForUpdate(sku);
+              if (quantity <= 0 || Available(item) < quantity)
+              {
+                  return false;
+              }
+              item.Reserved += quantity;
+              _stock.Save(item);
+              return true;
+          }
+
+          public void Ship(string sku, int quantity)
+          {
+              var item = _stock.GetForUpdate(sku);
+              item.Reserved -= quantity;
+              item.OnHand -= quantity;
+              _stock.Save(item);
+          }
+
+          public void ReleaseReservation(string sku, int quantity)
+          {
+              var item = _stock.GetForUpdate(sku);
+              if (quantity <= 0 || quantity > item.Reserved)
+              {
+                  throw new ArgumentOutOfRangeException(nameof(quantity));
+              }
+              item.Reserved -= quantity;
+              item.OnHand += quantity;
+              _stock.Save(item);
+          }
+      }
+
+  - name: blind-07
+    validator: correctness
+    note: "Clean. Correct version of the project deletion permission: projects outside the user's organisation are denied first, then org owners are allowed, then project admins."
+    expect: []
+    input: |
+      TITLE: Restrict project deletion to project admins and org owners
+      TICKET:
+      PRJ-140: Only project admins should be able to delete a project; today any
+      member can. Organisation owners can delete any project in their own
+      organisation. Everyone else gets 403. (Each user belongs to exactly one
+      organisation; User.getOrgRole() is their role in it.)
+      DESCRIPTION:
+      Adds ProjectPermissions.canDelete (org owner of the project's organisation,
+      or admin of the project) and uses it on the delete endpoint instead of
+      canEdit, so plain members can no longer delete projects.
+      DIFF:
+      --- a/src/main/java/com/quillstack/projects/ProjectPermissions.java
+      +++ b/src/main/java/com/quillstack/projects/ProjectPermissions.java
+      @@ -1,13 +1,26 @@
+       package com.quillstack.projects;
+       
+      +import com.quillstack.accounts.OrgRole;
+       import com.quillstack.accounts.User;
+       
+       public final class ProjectPermissions {
+       
+           private ProjectPermissions() {
+           }
+       
+           public static boolean canEdit(User user, Project project) {
+               return project.hasMember(user.getId());
+           }
+      +
+      +    public static boolean canDelete(User user, Project project) {
+      +        if (!project.getOrgId().equals(user.getOrgId())) {
+      +            return false;
+      +        }
+      +        if (user.getOrgRole() == OrgRole.OWNER) {
+      +            return true;
+      +        }
+      +        return project.getMemberRole(user.getId())
+      +            .map(role -> role == ProjectRole.ADMIN)
+      +            .orElse(false);
+      +    }
+       }
+      --- a/src/main/java/com/quillstack/projects/ProjectController.java
+      +++ b/src/main/java/com/quillstack/projects/ProjectController.java
+      @@ -48,7 +48,7 @@ public final class ProjectController {
+           public Response delete(RequestContext ctx, long projectId) {
+               User user = ctx.currentUser();
+               Project project = projects.findById(projectId).orElseThrow(ProjectNotFoundException::new);
+      -        if (!ProjectPermissions.canEdit(user, project)) {
+      +        if (!ProjectPermissions.canDelete(user, project)) {
+                   return Response.forbidden();
+               }
+               projects.delete(project);
+
+  - name: blind-08
+    validator: correctness
+    note: "The credit is computed from elapsed_days (the part of the period already used) instead of the days remaining (period_end - today). A downgrade on the first day of the period gets no credit and one on the last day gets almost the full difference; the ticket asks for the unused part."
+    expect: [logic, acceptance-criteria, data-integrity]
+    expect_words: ["elapsed", "days used", "already used", "used portion", "used part", "portion used", "unused", "remaining days", "days remaining", "rest of the period", "period_end - today", "inverted", "backwards"]
+    min_severity: medium
+    input: |
+      TITLE: Credit customers for mid-period plan downgrades
+      TICKET:
+      BILL-207: When a customer switches to a cheaper plan part-way through a
+      billing period, credit their account with the price difference for the
+      unused part of the current period, prorated by day and rounded down to the
+      cent. A billing period runs from period_start up to, but not including,
+      period_end. Upgrades are out of scope (BILL-212).
+      DESCRIPTION:
+      Adds downgrade_credit_cents and records the credit in the same transaction
+      as the plan switch. change_plan now raises ValueError when the change date
+      is outside the current billing period, since the proration is undefined
+      there. Upgrades still switch plan with no credit, as before.
+      DIFF:
+      --- a/billing/plan_change.py
+      +++ b/billing/plan_change.py
+      @@ -1,11 +1,28 @@
+      +from datetime import date
+      +
+       from billing.db import transaction
+       from billing.ledger import Ledger
+       from billing.models import Plan, Subscription
+       
+       
+      -def change_plan(sub, new_plan, today, ledger):
+      +def downgrade_credit_cents(sub: Subscription, new_plan: Plan, today: date) -> int:
+      +    """Credit owed for the price difference over the rest of the period."""
+      +    if not (sub.period_start <= today < sub.period_end):
+      +        raise ValueError("plan change date is outside the current billing period")
+      +    price_diff = sub.plan.price_cents - new_plan.price_cents
+      +    if price_diff <= 0:
+      +        return 0
+      +    period_days = (sub.period_end - sub.period_start).days
+      +    elapsed_days = (today - sub.period_start).days
+      +    return price_diff * elapsed_days // period_days
+      +
+      +
+      +def change_plan(sub: Subscription, new_plan: Plan, today: date, ledger: Ledger) -> None:
+           if new_plan.id == sub.plan.id:
+               return
+      +    credit = downgrade_credit_cents(sub, new_plan, today)
+           with transaction():
+      +        if credit:
+      +            ledger.add_credit(sub.customer_id, credit, reason="downgrade proration")
+               sub.plan = new_plan
+               sub.save()

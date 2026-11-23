@@ -1,16 +1,16 @@
 """The release verdict, a pure function of the validators' results:
 BLOCK on any critical; HOLD on any high, a failed validator, or missing required CI;
-AUTO-FIX on only medium/low or failed CI; otherwise PASS."""
+MINOR on only medium/low or failed CI; otherwise PASS."""
 from collections import Counter
 
-BLOCK, HOLD, AUTO_FIX, PASS = "BLOCK", "HOLD", "AUTO-FIX", "PASS"
+BLOCK, HOLD, MINOR, PASS = "BLOCK", "HOLD", "MINOR", "PASS"
 
 
 def decide(results: list[dict], ci_status: str | None = None, require_ci: bool = False) -> tuple[str, str]:
     """results: [{"status": "ok" | "partial" | "failed", "findings": [...]}, ...]
     "partial" means a validator reviewed only some parts of a large PR (an error or the time
     limit stopped it); its findings still count, and it also counts as missing evidence.
-    ci_status: None (not connected), "passed", or "failed"."""
+    ci_status: "passed", "failed", or None (unknown: no CI connected, still running, or unreadable)."""
     if not results:
         return HOLD, "no validators ran"
 
@@ -30,9 +30,12 @@ def decide(results: list[dict], ci_status: str | None = None, require_ci: bool =
     if hold:
         return HOLD, "; ".join(hold)
 
-    if ci_status == "failed":
-        return AUTO_FIX, "CI failed"
+    minor = []
     if sev["medium"] or sev["low"]:
-        return AUTO_FIX, f"{sev['medium']} medium and {sev['low']} low finding(s)"
+        minor.append(f"{sev['medium']} medium and {sev['low']} low finding(s)")
+    if ci_status == "failed":
+        minor.append("CI failed")
+    if minor:
+        return MINOR, "; ".join(minor)
 
     return PASS, "no findings above info" + ("; CI passed" if ci_status == "passed" else "; no CI results")

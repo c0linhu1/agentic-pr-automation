@@ -13,5 +13,5 @@ slack_bot/manifest.json
 slack_bot/manifest.yaml
 MODEL_FINDINGS.md
 failed_replies/
-vader/__init__.py
-tests/__init__.py
+ollama-start.ps1
+ollama-stop.ps1

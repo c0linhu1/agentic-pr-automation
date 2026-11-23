@@ -1,29 +1,15 @@
-import json
-import tempfile
-import time
 import unittest
-from pathlib import Path
 from unittest import mock
 
 from slack_bot import fmt
+from tests.helpers import response, use_github
 from vader import config, report
-from vader.engine import Engine, Events, Review
+from vader.engine import Events, Review
 from vader.github import GitHubPoller
-from vader.state import State
 
 
-def wait_for(cond, timeout=5):
-    end = time.time() + timeout
-    while time.time() < end:
-        if cond():
-            return True
-        time.sleep(0.02)
-    return False
-
-
-CRITICAL = json.dumps({"findings": [{"severity": "critical", "category": "injection", "file": "api/search.py",
-                                     "line": 3, "description": "SQL built from user input.",
-                                     "suggestedFix": "Use parameters."}]})
+CRITICAL = {"severity": "critical", "category": "injection", "file": "api/search.py", "line": 3,
+            "description": "SQL built from user input.", "suggestedFix": "Use parameters."}
 
 
 def done_review() -> Review:
@@ -35,50 +21,30 @@ def done_review() -> Review:
     r.models = {"security": "m:1b", "qa": "m:1b"}
     r.results = [
         {"validator": "security", "display_name": "Security Validator", "icon": ":shield:", "status": "ok",
-         "findings": json.loads(CRITICAL)["findings"], "error": None},
+         "findings": [dict(CRITICAL)], "error": None},
         {"validator": "qa", "display_name": "QA Validator", "icon": ":test_tube:", "status": "failed",
          "findings": [], "error": "timed out"},
     ]
     return r
 
 
-class OnDoneTests(unittest.TestCase):
-    def test_on_done_runs_after_each_review(self):
-        with tempfile.TemporaryDirectory() as d:
-            state = State(Path(d) / "state.json", default_model="m:1b")
-            engine = Engine(state, Events(), complete=lambda *a, **k: '{"findings": []}',
-                            prepare_model=lambda m: None, assignments=dict)
-            seen = []
-            engine.on_done = seen.append
-            engine.start()
-            r = Review(source="slack", validators=["qa"], diff="+x")
-            engine.submit(r)
-            self.assertTrue(wait_for(lambda: seen == [r]))
-
-
 class PrCommentTests(unittest.TestCase):
     def setUp(self):
         self.events = Events()
         self.poller = GitHubPoller(mock.Mock(), self.events, mock.Mock())
-        self.gh = mock.MagicMock()
-        self.gh.__enter__.return_value = self.gh
-        patches = [mock.patch.object(GitHubPoller, "_client", return_value=self.gh),
-                   mock.patch.object(config, "GITHUB_TOKEN", "t"), mock.patch.object(config, "GITHUB_COMMENT", True)]
-        for p in patches:
-            p.start()
-            self.addCleanup(p.stop)
+        use_github(self)
+        self.enterContext(mock.patch.object(config, "GITHUB_COMMENT", True))
 
     def test_posts_the_report_on_the_pr(self):
-        self.gh.post.return_value = mock.Mock(status_code=201, json=lambda: {"html_url": "https://x/c/1"})
         self.poller.comment_on_pr(done_review())
-        path, = self.gh.post.call_args.args
-        self.assertEqual(path, "/repos/o/r/issues/7/comments")
-        self.assertIn("BLOCK", self.gh.post.call_args.kwargs["json"]["body"])
+        (number, body), = self.gh.comments
+        self.assertEqual(number, 7)
+        self.assertIn("BLOCK", body)
         self.assertEqual([(e["type"], e.get("url")) for e in self.events.since(0)],
-                         [("pr_comment_posted", "https://x/c/1")])
+                         [("pr_comment_posted", "https://github.com/repos/o/r/issues/7/comments#c1")])
 
     def test_missing_write_permission_is_reported_not_raised(self):
-        self.gh.post.return_value = mock.Mock(status_code=403, text="forbidden")
+        self.gh.comment_reply = response(403, "forbidden")
         self.poller.comment_on_pr(done_review())
         event, = self.events.since(0)
         self.assertEqual(event["type"], "pr_comment_failed")
@@ -88,7 +54,7 @@ class PrCommentTests(unittest.TestCase):
         self.poller.comment_on_pr(Review(source="slack", validators=["qa"], diff="+x"))
         with mock.patch.object(config, "GITHUB_COMMENT", False):
             self.poller.comment_on_pr(done_review())
-        self.gh.post.assert_not_called()
+        self.assertEqual(self.gh.comments, [])
 
 
 class ReportTests(unittest.TestCase):

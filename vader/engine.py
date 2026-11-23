@@ -17,7 +17,7 @@ from . import config, llm, models
 from .agents import VALIDATORS
 from .decision import decide
 from .diffs import FileDiff, filter_files, pack, pack_with_context, split_files
-from .findings import SEVERITIES, VERIFY_SCHEMA, parse_findings
+from .findings import SEVERITIES, VERIFY_SCHEMA, agreed, code_lines, ground, parse_findings
 from .state import State
 
 log = logging.getLogger("vader.engine")
@@ -55,7 +55,7 @@ class Review:
     description: str = ""
     ticket: str = ""
     diff: str = ""
-    meta: dict = field(default_factory=dict)  # PR number, repo, url, author, copilot, ...
+    meta: dict = field(default_factory=dict)  # PR number, repo, url, author, linked issue, ...
     reply_to: dict | None = None  # opaque to Vader; set by a front-end
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     status: str = "queued"  # queued -> running -> done
@@ -74,9 +74,15 @@ class Review:
     estimate_s: float | None = None
     time_limited: bool = False
     ci: list[dict] | None = None  # the PR commit's check runs; None = unknown
+    merge: dict | None = None  # {"status": merged|conflict|skipped|failed, "branch", "message"} after a PASS
+    test_layout: str = ""  # the TESTS line: which kinds of code the repo has tests for (PR reviews)
+    unavailable: bool = False  # the model server couldn't be reached, so nothing was reviewed (tried again)
     context: dict[str, str] = field(default_factory=dict, repr=False)  # path -> full file after the change
     _parts: list[list[FileDiff]] = field(default_factory=list, repr=False)
     _calls_done: int = field(default=0, repr=False)
+    _served: bool = field(default=False, repr=False)  # the model server answered at least once
+    _server_down: bool = field(default=False, repr=False)  # a load or call found it unreachable
+    _code: dict | None = field(default=None, repr=False)  # path -> its lines as shown, for checking quotes
 
     @property
     def ci_status(self) -> str | None:
@@ -103,7 +109,8 @@ class Review:
         lines = [f"TITLE: {self.title}" if self.title else "",
                  f"TICKET: {self.ticket}" if self.ticket else "",
                  f"DESCRIPTION:\n{self.description}" if self.description else "",
-                 self.ci_line()]
+                 self.ci_line(),
+                 self.test_layout]
         if self.parts > 1 or self.skipped_files:
             listed = self.files[:MAX_LISTED_FILES]
             more = len(self.files) - len(listed)
@@ -126,13 +133,12 @@ class Review:
         diff = "\n".join(f.text for f in files)
         context = "\n\n".join(f"=== {f.path} ===\n{f.context}" for f in files if f.context)
         if context:
-            context = ("CONTEXT (full contents of changed files after this change, so you can see the code "
-                       "around the diff; review only what the DIFF changes):\n" + context)
+            context = "CONTEXT (the changed files in full, after the change; for reading only):\n" + context
         return "\n\n".join(x for x in [self.header(), note, context, f"DIFF:\n{diff}"] if x)
 
     def summary(self) -> dict:
         """A snapshot without the large text fields (events keep it as it was at that moment)."""
-        skip = {"diff", "description", "ticket", "context", "_parts", "_calls_done"}
+        skip = {"diff", "description", "ticket", "context", "_parts", "_calls_done", "_served", "_server_down", "_code"}
         return copy.deepcopy({f.name: getattr(self, f.name) for f in fields(self) if f.name not in skip})
 
 
@@ -242,23 +248,27 @@ class Engine:
                     self._cv.wait(timeout=5)
                 review = self._queue.popleft()
                 self._running = review
+            self._process(review)
+
+    def _process(self, review: Review) -> None:
+        """Run one review to the end whatever happens, then hand it to on_done."""
+        try:
+            self._run(review)
+        except Exception:  # noqa: BLE001 - the worker must survive anything
+            log.exception("review %s crashed", review.id)
+            review.verdict, review.verdict_reason = "HOLD", "Vader crashed during the review; see its log"
+            review.status, review.finished = "done", time.time()
+            review.diff, review.context, review._parts, review._code = "", {}, [], None
+            self._mark_reviewed(review)  # so the poller doesn't requeue it
+            self.events.add("review_done", review=review.summary())
+        finally:
+            with self._cv:
+                self._running = None
+        if self.on_done and review.status == "done":
             try:
-                self._run(review)
-            except Exception:  # noqa: BLE001 - the worker must survive anything
-                log.exception("review %s crashed", review.id)
-                review.verdict, review.verdict_reason = "HOLD", "Vader crashed during the review; see its log"
-                review.status, review.finished = "done", time.time()
-                review.diff, review.context, review._parts = "", {}, []
-                self._mark_reviewed(review)  # so the poller doesn't requeue it
-                self.events.add("review_done", review=review.summary())
-            finally:
-                with self._cv:
-                    self._running = None
-            if self.on_done and review.status == "done":
-                try:
-                    self.on_done(review)
-                except Exception:  # noqa: BLE001 - reporting must never stop the queue
-                    log.exception("on_done hook failed for review %s", review.id)
+                self.on_done(review)
+            except Exception:  # noqa: BLE001 - reporting must never stop the queue
+                log.exception("on_done hook failed for review %s", review.id)
 
     def _plan(self, review: Review) -> None:
         """Drop files nobody should review and split the rest into parts that fit the context."""
@@ -268,8 +278,8 @@ class Engine:
         longest_skill = max(len(VALIDATORS[k].instructions()) for k in review.validators)
 
         def budget() -> int:
-            # llm.py estimates 1 token per 3 characters, so budget in the same units.
-            chars = ((config.CONTEXT_TOKENS - config.OUTPUT_TOKENS) * 3 - longest_skill
+            # In characters, at llm.py's characters-per-token estimate.
+            chars = (int((config.CONTEXT_TOKENS - config.OUTPUT_TOKENS) * llm.CHARS_PER_TOKEN) - longest_skill
                      - len(review.header()) - 800 - SAFETY_CHARS)  # 800: part note + CONTEXT heading
             return max(chars, 4000)
 
@@ -326,6 +336,7 @@ class Engine:
                 except Exception as e:  # noqa: BLE001
                     load_error = f"model {model} couldn't be loaded: {e}"
                     self._last_model = None
+                    review._server_down |= isinstance(e, models.ModelServerDown)
                     log.warning(load_error)
             self._run_group(model, keys, review, load_error)
 
@@ -334,15 +345,28 @@ class Engine:
                                                      require_ci=config.REQUIRE_CI)
         if review.time_limited:
             review.verdict_reason += f"; stopped at the {config.REVIEW_TIME_LIMIT_MINUTES:g}-minute time limit"
+        # Any reply, even an unusable one, is evidence; only a server never reached means nothing was seen.
+        review.unavailable = bool(review._parts) and review._server_down and not review._served
+        if review.unavailable:
+            review.verdict_reason += "; Vader couldn't reach the model server, so nothing was reviewed"
         review.status, review.finished = "done", time.time()
-        review.diff, review.context, review._parts = "", {}, []  # free the code
+        review.diff, review.context, review._parts, review._code = "", {}, [], None  # free the code
         self._mark_reviewed(review)
         self.events.add("review_done", review=review.summary())
 
     def _mark_reviewed(self, review: Review) -> None:
-        """Record the PR commit so the poller skips it; only reviews by all six validators count."""
-        if review.meta.get("pr_key") and set(review.validators) == set(VALIDATORS):
-            self.state.mark_reviewed(review.meta["pr_key"], review.meta["sha"])
+        """Record the PR commit so the poller skips it; only reviews by all six validators count. A commit
+        held or blocked for its findings (not just for a validator that didn't finish) is also recorded, so a
+        later PASS of the same commit isn't merged without a person."""
+        key = review.meta.get("pr_key")
+        if not key or review.unavailable:
+            return
+        if set(review.validators) == set(VALIDATORS):
+            self.state.mark_reviewed(key, review.meta["sha"])
+        serious = [f for r in review.results for f in r["findings"] if f["severity"] in ("critical", "high")]
+        if review.verdict in ("BLOCK", "HOLD") and serious:
+            self.state.mark_held(key, review.meta["sha"],
+                                 f"{review.verdict}: " + "; ".join(f["description"][:150] for f in serious[:3]))
 
     def _run_group(self, model: str, keys: list[str], review: Review, load_error: str | None) -> None:
         """Run the validators that share one model, part by part so consecutive calls share a prompt
@@ -372,28 +396,45 @@ class Engine:
     def _run_part(self, model: str, key: str, review: Review, i: int, run: dict) -> None:
         review.current = key if review.parts == 1 else f"{key} (part {i + 1}/{review.parts})"
         result, label = run["result"], "" if review.parts == 1 else f"part {i + 1}: "
-        start = time.time()
-        try:
-            parsed = self._ask(model, VALIDATORS[key], review, i)
-            if parsed.failure:
-                run["errors"].append(label + parsed.failure)
-            else:
-                run["findings"] += [{**f, "_part": i} for f in parsed.findings]  # _part: for the verify pass
-                result["dropped"] += parsed.dropped
-                result["parts_done"] += 1
-        except llm.LlmError as e:
-            run["errors"].append(f"{label}{e}")
-        except Exception as e:  # noqa: BLE001 - one validator's crash must not stop the others
-            log.exception("validator %s crashed", key)
-            run["errors"].append(f"crashed: {e}")
-        run["seconds"] += time.time() - start
-        self._estimate(review, time.time() - start)
+        answered, errors = 0, []
+        for n in range(asks(key)):  # several asks: their findings are combined (see `agreed`)
+            start = time.time()
+            try:
+                parsed = self._ask(model, VALIDATORS[key], review, i, run)
+                review._served = True
+                if parsed.failure:
+                    errors.append(label + parsed.failure)
+                else:
+                    # _part: for the verify pass; _ask: for counting how many asks agree
+                    run["findings"] += [{**f, "_part": i, "_ask": n} for f in parsed.findings]
+                    result["dropped"] += parsed.dropped
+                    answered += 1
+            except llm.LlmError as e:
+                review._served |= not isinstance(e, models.ModelServerDown)  # a timeout or bad reply: the server is up
+                review._server_down |= isinstance(e, models.ModelServerDown)
+                errors.append(f"{label}{e}")
+            except Exception as e:  # noqa: BLE001 - one validator's crash must not stop the others
+                log.exception("validator %s crashed", key)
+                errors.append(f"crashed: {e}")
+            run["seconds"] += time.time() - start
+            self._estimate(review, time.time() - start)
+            if review._server_down:
+                break
+        if answered:
+            result["parts_done"] += 1
+        else:
+            run["errors"] += errors
 
     def _report(self, review: Review, run: dict) -> None:
         result = run["result"]
-        merged, result["rejected"] = self._verify(result["model"], review, merge_findings(run["findings"]))
+        grounded, unquoted = self._ground(review, run["findings"])
+        agreeing = agreed(grounded, asks(result["validator"]))
+        merged, rejected = self._verify(result["model"], review, merge_findings(agreeing))
+        result["rejected"] = unquoted + rejected
         for f in merged:
             f.pop("_part", None)
+            f.pop("_ask", None)
+            f.pop("_verify", None)
         result["findings"], result["omitted"] = merged[:MAX_FINDINGS], max(len(merged) - MAX_FINDINGS, 0)
         if result["parts_done"] == review.parts:
             result["status"], result["error"] = "ok", None
@@ -404,16 +445,41 @@ class Engine:
         review.results.append(result)
         self.events.add("validator_done", review=review.summary(), result=result)
 
+    def _ground(self, review: Review, findings: list[dict]) -> tuple[list[dict], list[dict]]:
+        """Drop findings that quote code the validator wasn't shown, and take each kept finding's file and
+        line from where its quote is. Returns (kept, dropped)."""
+        if review._code is None:
+            shown: dict[str, list[str]] = {}
+            for part in review._parts:
+                for f in part:
+                    texts = shown.setdefault(f.path, ["", ""])
+                    texts[0] += f.text + "\n"
+                    texts[1] = texts[1] or f.context
+            review._code = {path: code_lines(diff, context) for path, (diff, context) in shown.items()}
+        kept, dropped = [], []
+        pr_text = "\n".join([review.title, review.ticket, review.description])
+        for f in findings:
+            why = ground(f, review._code, pr_text)
+            if why:
+                quoted = str(f.get("evidence") or "")
+                dropped.append({"severity": f["severity"], "description": f["description"], "reason": why,
+                                "evidence": quoted})
+                log.info("dropped %s %s: %s; it quoted %r", f["severity"], f.get("category"), why, quoted[:500])
+            else:
+                kept.append(f)
+        return kept, dropped
+
     def _verify(self, model: str, review: Review, findings: list[dict]) -> tuple[list[dict], list[dict]]:
-        """Re-check each VERIFY_SEVERITIES finding against the same code; only an explicit "rejected"
-        drops it. Returns (kept, rejected)."""
+        """Re-check each VERIFY_SEVERITIES finding, and each one marked `_verify` (a minor finding most asks
+        didn't report), against the same code; only an explicit "rejected" drops it. Returns (kept, rejected)."""
         kept, rejected = [], []
         deadline = self._deadline(review)
         for f in findings:
-            if f["severity"] not in config.VERIFY_SEVERITIES or (deadline and time.time() > deadline):
+            checked = f["severity"] in config.VERIFY_SEVERITIES or f.get("_verify")
+            if not checked or (deadline and time.time() > deadline):
                 kept.append(f)
                 continue
-            claim = {k: f.get(k) for k in ("severity", "category", "file", "line", "description")}
+            claim = {k: f.get(k) for k in ("file", "line", "evidence", "description", "severity", "category")}
             start = time.time()
             try:
                 reply = json.loads(self._complete(model, VERIFY_TASK + json.dumps(claim),
@@ -430,11 +496,20 @@ class Engine:
                      time.time() - start)
         return kept, rejected
 
-    def _ask(self, model: str, v, review: Review, part: int):
+    def _ask(self, model: str, v, review: Review, part: int, run: dict | None = None):
         """One model call for one part, parsed; re-asked PARSE_RETRIES times if unusable (each bad
-        reply is saved to FAILED_REPLIES_DIR)."""
+        reply is saved to FAILED_REPLIES_DIR). A model that thinks until it runs out of reply space is
+        asked once more without thinking: a quicker, shallower answer is evidence, a failure isn't."""
+        schema, instructions = v.schema(), v.instructions()
         for attempt in range(1 + config.PARSE_RETRIES):
-            raw = self._complete(model, v.instructions(), review.prompt(part))
+            try:
+                raw = self._complete(model, instructions, review.prompt(part), schema=schema)
+            except llm.OutputLimit as e:
+                log.warning("%s on %s: %s; asking again without thinking", v.key, model, e)
+                raw = self._complete(model, instructions, review.prompt(part), schema=schema, think=False)
+                if run is not None:
+                    run["result"]["note"] = ("answered without thinking: it ran out of reply space while thinking, "
+                                             "so this check is shallower")
             parsed = parse_findings(raw)
             if not parsed.failure:
                 return parsed
@@ -460,7 +535,7 @@ class Engine:
         left). Front-ends are told once, after the first call."""
         first = review.estimate_s is None
         review._calls_done += 1
-        calls = review.parts * len(review.validators)
+        calls = review.parts * sum(asks(k) for k in review.validators)
         elapsed = time.time() - (review.started or time.time())
         review.estimate_s = round(elapsed + last_call_s * max(calls - review._calls_done, 0))
         if not first:
@@ -469,6 +544,11 @@ class Engine:
         if review.parts > 1 or review.estimate_s >= 120 or (limit and review.estimate_s > limit):
             self.events.add("review_estimate", review=review.summary(), estimate_s=review.estimate_s,
                             limit_s=limit, calls=calls)
+
+
+def asks(key: str) -> int:
+    """How many times this validator is asked per part (VALIDATOR_ASKS; once by default)."""
+    return config.VALIDATOR_ASKS.get(key, 1)
 
 
 def merge_findings(findings: list[dict]) -> list[dict]:

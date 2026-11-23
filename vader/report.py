@@ -1,7 +1,8 @@
 """The written report of a finished review, as GitHub-flavored Markdown (for the PR comment)."""
 from .engine import Review
 
-VERDICT_ICON = {"BLOCK": "⛔", "HOLD": "✋", "AUTO-FIX": "🔧", "PASS": "✅"}
+VERDICT_ICON = {"BLOCK": "⛔", "HOLD": "✋", "MINOR": "🟡", "PASS": "✅"}
+MERGE_ICON = {"merged": "🔀", "conflict": "❌", "skipped": "⏸️", "failed": "⚠️"}
 SEV_ICON = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "⚪", "info": "ℹ️"}
 GITHUB_LIMIT = 65_000  # GitHub's comment limit is 65,536 characters
 
@@ -21,6 +22,8 @@ def markdown(review: Review) -> str:
              f"Commit `{sha}` · {len(review.files)} file(s)"
              + (f" in {review.parts} parts" if review.parts > 1 else "")
              + f" · model(s): {', '.join(f'`{m}`' for m in models)} · {_minutes(took)}", ""]
+    if review.merge:
+        lines += [f"{MERGE_ICON.get(review.merge['status'], '')} {review.merge['message']}", ""]
     if review.ci is not None:
         lines += ["CI: " + (", ".join(f"`{c['name']}` {c['conclusion'] or c['status']}" for c in review.ci)
                             or "no checks ran"), ""]
@@ -35,6 +38,8 @@ def markdown(review: Review) -> str:
             result = f"{len(r['findings'])} finding(s)" if r["findings"] else "no findings"
             if r["status"] == "partial":
                 result += f" (incomplete: {r['error']})"
+        if r.get("note"):
+            result += f" ({r['note']})"
         lines.append(f"| {r['display_name']} | {result.replace('|', '/')} |")
 
     findings = [(r["display_name"], f) for r in review.results for f in r["findings"]]
@@ -51,8 +56,12 @@ def markdown(review: Review) -> str:
 
     dropped = [(r["display_name"], x) for r in review.results for x in r.get("rejected") or []]
     if dropped:
-        lines += ["", "<details><summary>Dropped after re-check</summary>", ""]
-        lines += [f"- {name} ({x['severity']}): {x['description']}  \n  _Reason:_ {x['reason']}" for name, x in dropped]
+        lines += ["", "<details><summary>Dropped after checking (quote not found, or rejected by the verify pass)</summary>", ""]
+        for name, x in dropped:
+            lines.append(f"- {name} ({x['severity']}): {x['description']}  \n  _Reason:_ {x['reason']}")
+            if x.get("evidence"):  # so a person can see whether the drop was right
+                quoted = " ".join(x["evidence"].split()).replace("`", "'")
+                lines.append(f"  _It quoted:_ `{quoted[:200]}`" + ("…" if len(quoted) > 200 else ""))
         lines += ["", "</details>"]
 
     lines += ["", "<sub>Automated review by Vader's validators on local open-weight models. Findings can be "

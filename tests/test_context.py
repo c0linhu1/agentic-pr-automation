@@ -1,9 +1,12 @@
 import unittest
 from unittest import mock
 
+import httpx
+
+from vader import llm
 from vader.diffs import FileDiff, pack, pack_with_context
 from vader.engine import Review
-from vader.github import CONTEXT_MAX_CHARS, GitHubPoller
+from vader.github import CONTEXT_MAX_CHARS, GitHubPoller, tests_summary
 
 
 def diff(path: str, n: int = 5) -> FileDiff:
@@ -37,9 +40,9 @@ class PackWithContextTests(unittest.TestCase):
 class PromptTests(unittest.TestCase):
     def test_context_section_comes_before_the_diff(self):
         r = Review(source="github", validators=["qa"], title="t")
-        r._parts = [[FileDiff("a.cs", "+x", "class A { int Price() => Greeks(); }")]]
+        r._parts = [[FileDiff("a.cs", "+x", "class A {}")]]
         prompt = r.prompt(0)
-        self.assertIn("CONTEXT (full contents of changed files", prompt)
+        self.assertIn("CONTEXT (the changed files in full", prompt)
         self.assertIn("=== a.cs ===\nclass A", prompt)
         self.assertLess(prompt.index("CONTEXT"), prompt.index("DIFF:"))
 
@@ -51,7 +54,6 @@ class PromptTests(unittest.TestCase):
 
 class SharedPrefixTests(unittest.TestCase):
     def test_validators_share_everything_up_to_their_own_instructions(self):
-        from vader import llm
         pr = "TITLE: t\n\nDIFF:\n+x"
         a = llm.messages("Review security.", pr)
         b = llm.messages("Review tests.", pr)
@@ -59,6 +61,55 @@ class SharedPrefixTests(unittest.TestCase):
         shared = a[1]["content"].split(llm.TASK_HEADING)[0]
         self.assertTrue(b[1]["content"].startswith(shared))
         self.assertTrue(shared.startswith(pr))
+
+
+class TestLayoutTests(unittest.TestCase):
+    """The TESTS line: which kinds of code the repo has tests for, so QA can tell "no test" from "no test setup"."""
+
+    REPO = ["src/App.Web/Scripts/cart.ts", "src/App.Web/Views/Orders/_Form.cshtml", "src/App.Billing/Invoice.cs",
+            "tests/App.Billing.Tests/InvoiceTests.cs", "tests/App.Billing.Tests/Helpers/Fixtures.cs",
+            "tests/App.Web.Tests/OrdersTests.cs", "tests/App.Web.Tests/data/orders.json", "README.md"]
+
+    def test_names_the_tests_and_the_changed_code_that_has_none(self):
+        line = tests_summary(self.REPO, ["src/App.Web/Scripts/cart.ts", "src/App.Web/Views/Orders/_Form.cshtml"])
+        self.assertEqual(line, "TESTS: the repo's test files are 3 .cs files (tests/App.Billing.Tests, "
+                               "tests/App.Web.Tests). There are no test files for .ts, which this PR changes.")
+
+    def test_changed_code_with_tests_of_its_kind_isnt_flagged(self):
+        repo = self.REPO + ["src/App.Web/Scripts/format.spec.ts"]
+        line = tests_summary(repo, ["src/App.Web/Scripts/cart.tsx", "src/App.Billing/Invoice.cs"])
+        self.assertIn("1 .ts file (src/App.Web/Scripts)", line)
+        self.assertNotIn("There are no test files", line)  # .tsx is covered by .ts tests
+
+    def test_recognises_common_test_naming(self):
+        tests = ["pkg/api/test_orders.py", "svc/orders_test.go", "web/src/__tests__/cart.js", "lib/Cart.test.mjs",
+                 "spec/models/user_spec.rb", "src/OrderServiceTest.java"]
+        not_tests = ["src/Contest.cs", "src/latest.py", "docs/testing.md", "src/attestation.go"]
+        line = tests_summary(tests + not_tests, [])
+        for kind in ["1 .py", "1 .go", "2 .js", "1 .rb", "1 .java"]:
+            self.assertIn(kind, line)
+        self.assertNotIn(".cs", line)
+
+    def test_no_tests_at_all_and_partial_listings_say_so(self):
+        self.assertEqual(tests_summary(["src/a.py"], ["src/a.py"]), "TESTS: the repo has no test files.")
+        self.assertIn("may be incomplete", tests_summary(self.REPO, [], truncated=True))
+
+    def test_header_carries_it_and_a_failed_lookup_leaves_it_out(self):
+        r = Review(source="github", validators=["qa"], title="t", test_layout="TESTS: the repo has no test files.")
+        r._parts = [[FileDiff("a.ts", "+x")]]
+        self.assertLess(r.prompt(0).index("TESTS:"), r.prompt(0).index("DIFF:"))
+        self.assertNotIn("TESTS:", Review(source="slack", validators=["qa"], title="t").header())
+        gh = mock.Mock(get=mock.Mock(return_value=mock.Mock(status_code=404)))
+        self.assertEqual(GitHubPoller._test_layout(gh, "o/r", "abc", ["a.ts"]), "")
+
+    def test_reads_the_tree_at_the_reviewed_commit(self):
+        tree = {"truncated": False, "tree": [{"path": p, "type": "blob"} for p in self.REPO] + [
+            {"path": "tests/App.Web.Tests", "type": "tree"}]}
+        gh = mock.Mock(get=mock.Mock(return_value=mock.Mock(status_code=200, json=lambda: tree)))
+        line = GitHubPoller._test_layout(gh, "o/r", "abc", ["src/App.Web/Scripts/cart.ts"])
+        self.assertEqual(gh.get.call_args.args[0], "/repos/o/r/git/trees/abc")
+        self.assertEqual(gh.get.call_args.kwargs["params"], {"recursive": "1"})
+        self.assertIn("3 .cs files", line)
 
 
 class FetchTests(unittest.TestCase):
@@ -87,7 +138,6 @@ class FetchTests(unittest.TestCase):
         self.assertNotIn("/repos/o/r/contents/src/Old.cs", fetched)
 
     def test_a_failure_listing_files_just_means_no_context(self):
-        import httpx
         gh = mock.Mock(get=mock.Mock(side_effect=httpx.ConnectError("down")))
         self.assertEqual(GitHubPoller._file_contents(gh, "o/r", 16, "abc"), {})
 

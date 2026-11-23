@@ -1,5 +1,5 @@
-"""Vader's HTTP API on localhost (run: python -m vader.service). The only program that talks to
-Ollama and GitHub; front-ends must send the shared X-Vader-Key."""
+"""Vader's HTTP API on localhost (run: python -m vader.service). The only program that talks to the
+model server and GitHub; front-ends must send the shared X-Vader-Key."""
 import logging
 import secrets
 import threading
@@ -73,8 +73,11 @@ def create_app(state: State, events: Events, engine: Engine, poller: GitHubPolle
     @app.get("/status", dependencies=auth)
     def status():
         return {"enabled": state.enabled, "automation": state.automation, "model": state.model,
+                "model_server": {"url": config.LLM_BASE_URL, "runtime": config.MODEL_RUNTIME,
+                                 "reachable": models.available() is not None},
                 "loaded": models.loaded(), "github": {"configured": bool(poller and poller.configured),
                                                       "repos": config.GITHUB_REPOS},
+                "auto_merge": config.AUTO_MERGE_BRANCH or None, "close_issues": config.CLOSE_LINKED_ISSUES,
                 **engine.status()}
 
     @app.post("/control", dependencies=auth)
@@ -94,12 +97,12 @@ def create_app(state: State, events: Events, engine: Engine, poller: GitHubPolle
     @app.get("/models", dependencies=auth)
     def list_models():
         default, entries = models.catalog()
-        have = models.pulled()
+        have = models.available()
         assigned = models.assignments()
         return {"active": state.model, "default": default, "loaded": models.loaded(),
                 "validators": {k: assigned.get(k, state.model) for k in VALIDATORS}, "models": [
             {"name": e.name, "tier": e.tier, "enabled": e.enabled, "note": e.note,
-             "pulled": None if have is None else e.name in have} for e in entries]}
+             "available": None if have is None else e.name in have} for e in entries]}
 
     @app.post("/model", dependencies=auth)
     def switch_model(body: ModelBody):
@@ -194,9 +197,11 @@ def create_app(state: State, events: Events, engine: Engine, poller: GitHubPolle
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)  # one line per Ollama/GitHub call is noise
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # one line per model server/GitHub call is noise
     if not config.API_KEY:
         raise SystemExit("Set VADER_API_KEY in .env.vader (the Slack bot needs the same value).")
+    if config.MODEL_RUNTIME not in ("generic", "ollama"):
+        raise SystemExit(f"MODEL_RUNTIME must be generic or ollama, not {config.MODEL_RUNTIME!r}.")
     problems = check_skills()
     if problems:
         raise SystemExit("Skills failed to load:\n  " + "\n  ".join(problems))
@@ -207,10 +212,11 @@ def main() -> None:
     engine = Engine(state, events)
     poller = GitHubPoller(state, events, engine)
     engine.before_review = poller.attach_ci  # PR reviews get their commit's CI results as evidence
-    engine.on_done = poller.comment_on_pr  # PR reviews also get the report as a PR comment
+    engine.on_done = poller.finish  # merge PRs that pass, then post the report as a PR comment
 
-    log.info("Vader on http://%s:%d | model %s | %s | automation %s | GitHub %s",
-             config.HOST, config.PORT, state.model, "running" if state.enabled else "STOPPED",
+    log.info("Vader on http://%s:%d | model server %s (%s) | model %s | %s | automation %s | GitHub %s",
+             config.HOST, config.PORT, config.LLM_BASE_URL, config.MODEL_RUNTIME, state.model,
+             "running" if state.enabled else "STOPPED",
              "on" if state.automation else "off",
              ", ".join(config.GITHUB_REPOS) if poller.configured else "not configured")
     assigned = models.assignments()
@@ -222,12 +228,13 @@ def main() -> None:
         problem = models.check_allowed(m)
         if problem:
             log.warning("%s; its validators will fail until models.yaml allows it", problem.replace("`", ""))
-    have = models.pulled()
+    have = models.available()
     if have is None:
-        log.warning("can't reach Ollama at %s; reviews will fail until it's running", config.OLLAMA_URL)
+        log.warning("can't reach the model server at %s; reviews wait until it's running", config.LLM_BASE_URL)
     else:
         for m in sorted(in_use - have):
-            log.warning("model %s isn't pulled; its validators will fail until you run: ollama pull %s", m, m)
+            log.warning("model %s isn't on the model server; its validators will fail until it's pulled or "
+                        "downloaded there", m)
 
     uvicorn.run(create_app(state, events, engine, poller, config.API_KEY),
                 host=config.HOST, port=config.PORT, log_level="warning")

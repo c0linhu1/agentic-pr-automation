@@ -1,13 +1,9 @@
-import tempfile
-import time
 import unittest
-from pathlib import Path
 from unittest import mock
 
-from vader import config
-from vader.engine import Engine, Events, Review
+from tests.helpers import EngineCase, use_github
+from vader.engine import Events, Review
 from vader.github import GitHubPoller
-from vader.state import State
 
 
 def run(name, conclusion, status="completed"):
@@ -18,9 +14,9 @@ class CiStatusTests(unittest.TestCase):
     def test_status(self):
         r = Review(source="github", validators=["qa"])
         self.assertIsNone(r.ci_status)                                   # unknown
-        r.ci = [run("build-test", "success"), run("docker", "skipped")]
+        r.ci = [run("build-test", "success"), run("lint", "skipped")]
         self.assertEqual(r.ci_status, "passed")
-        r.ci = [run("build-test", "failure"), run("docker", "success")]
+        r.ci = [run("build-test", "failure"), run("lint", "success")]
         self.assertEqual(r.ci_status, "failed")
         r.ci = [run("build-test", None, status="in_progress")]
         self.assertIsNone(r.ci_status)                                   # still running
@@ -33,33 +29,30 @@ class CiStatusTests(unittest.TestCase):
         self.assertIn("doesn't prove the tests themselves are right", r.header())
 
 
-class CiInVerdictTests(unittest.TestCase):
-    def test_failed_ci_with_no_findings_is_auto_fix(self):
-        with tempfile.TemporaryDirectory() as d:
-            engine = Engine(State(Path(d) / "s.json", "m:1b"), Events(), complete=lambda *a, **k: '{"findings": []}',
-                            prepare_model=lambda m: None, assignments=dict)
-            engine.before_review = lambda r: setattr(r, "ci", [run("build-test", "failure")])
-            engine.start()
-            review = Review(source="github", validators=["qa"], diff="+x")
-            engine.submit(review)
-            end = time.time() + 5
-            while review.status != "done" and time.time() < end:
-                time.sleep(0.02)
-        self.assertEqual((review.verdict, review.verdict_reason), ("AUTO-FIX", "CI failed"))
+class CiInVerdictTests(EngineCase):
+    def test_failed_ci_with_no_findings_is_minor(self):
+        engine = self.engine()
+        engine.before_review = lambda r: setattr(r, "ci", [run("build-test", "failure")])
+        review = self.finish(Review(source="github", validators=["qa"], diff="+x"), engine)
+        self.assertEqual((review.verdict, review.verdict_reason), ("MINOR", "CI failed"))
 
 
 class AttachCiTests(unittest.TestCase):
     def test_reads_check_runs_for_the_commit(self):
-        gh = mock.MagicMock()
-        gh.__enter__.return_value = gh
-        gh.get.return_value = mock.Mock(status_code=200, json=lambda: {"check_runs": [
-            {"name": "build-test", "status": "completed", "conclusion": "success", "extra": 1}]})
-        poller = GitHubPoller(mock.Mock(), Events(), mock.Mock())
+        use_github(self).checks = [{"name": "build-test", "status": "completed", "conclusion": "success", "extra": 1}]
         review = Review(source="github", validators=["qa"], meta={"repo": "o/r", "sha": "abc", "pr_key": "o/r#18"})
-        with mock.patch.object(GitHubPoller, "_client", return_value=gh), mock.patch.object(config, "GITHUB_TOKEN", "t"):
-            poller.attach_ci(review)
-        self.assertEqual(gh.get.call_args.args[0], "/repos/o/r/commits/abc/check-runs")
+        GitHubPoller(mock.Mock(), Events(), mock.Mock()).attach_ci(review)
         self.assertEqual(review.ci, [run("build-test", "success")])
+
+    def test_a_failure_past_the_first_page_is_still_seen(self):
+        # A big matrix build: the one failing check is number 150, on GitHub's second page.
+        use_github(self).checks = [run(f"job {i}", "success") for i in range(149)] + [run("job 149", "failure")]
+        review = Review(source="github", validators=["qa"], meta={"repo": "o/r", "sha": "abc", "pr_key": "o/r#18"})
+        GitHubPoller(mock.Mock(), Events(), mock.Mock()).attach_ci(review)
+        self.assertEqual((len(review.ci), review.ci_status), (150, "failed"))
+        with mock.patch("vader.github.CHECK_RUN_PAGES", 1), self.assertLogs("vader.github", "WARNING"):
+            GitHubPoller(mock.Mock(), Events(), mock.Mock()).attach_ci(review)
+        self.assertIsNone(review.ci)  # couldn't read them all: unknown, never "passed"
 
     def test_no_pr_means_no_ci(self):
         review = Review(source="slack", validators=["qa"], diff="+x")
