@@ -21,13 +21,15 @@ class VaderClient:
             r = self._http.request(method, path, **kwargs)
         except httpx.TransportError as e:
             raise VaderUnavailable(str(e)) from None
+        try:
+            body = r.json()
+        except ValueError:
+            body = None
         if r.status_code >= 400:
-            try:
-                detail = r.json().get("detail", r.text)
-            except ValueError:
-                detail = r.text
-            raise VaderError(str(detail))
-        return r.json()
+            raise VaderError(str(body.get("detail", r.text) if isinstance(body, dict) else r.text))
+        if not isinstance(body, dict):  # anything the bot can't read is an error it can show, not a crash
+            raise VaderError(f"Vader sent a reply the bot can't read (HTTP {r.status_code})")
+        return body
 
     def status(self) -> dict:
         return self._call("GET", "/status")

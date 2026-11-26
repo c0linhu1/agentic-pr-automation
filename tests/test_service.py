@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -103,6 +105,36 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(r.status_code, 409)
         self.assertEqual(self.state.model, "gpt-oss:20b")
 
+    def test_a_review_queued_while_a_switch_is_loading_waits_for_the_load(self):
+        lock, active, order = threading.Lock(), [0], []
+        overlaps, loading, release = [], threading.Event(), threading.Event()
+
+        def load(name, gate=None):
+            with lock:
+                active[0] += 1
+                overlaps.append(active[0])
+                order.append(name)
+            if gate:
+                loading.set()
+                gate.wait(5)
+            with lock:
+                active[0] -= 1
+
+        self.engine._prepare = load  # the review's own load
+        with mock.patch("vader.service.models.check_selectable", return_value=None), \
+             mock.patch("vader.service.models.ensure_only", side_effect=lambda name: load(name, release)):
+            self.client.post("/model", json={"name": "gpt-oss:20b"}, headers=KEY)
+            self.assertTrue(loading.wait(5))
+            r = self.client.post("/reviews", json={"text": "+x", "validators": ["qa"]}, headers=KEY)
+            review_id = r.json()["id"]
+            self.assertTrue(wait_for(lambda: self.engine.busy))  # the worker has picked it up...
+            time.sleep(0.1)
+            self.assertEqual(order, ["gpt-oss:20b"])  # ...but doesn't load until the switch has
+            release.set()
+            self.assertTrue(wait_for(lambda: self.engine.get(review_id).status == "done"))
+        self.assertEqual((order, max(overlaps)), (["gpt-oss:20b", "gpt-oss:20b"], 1))
+        self.assertIn("model_ready", [e["type"] for e in self.events.since(0)])
+
     def test_the_slack_bots_other_endpoints(self):
         r = self.client.post("/automation", json={"enabled": True}, headers=KEY).json()
         self.assertEqual((r, self.state.automation), ({"automation": True, "github_configured": False}, True))
@@ -124,17 +156,17 @@ class ServiceTests(unittest.TestCase):
 
 class PrRefTests(unittest.TestCase):
     def test_forms(self):
-        self.assertEqual(parse_pr_ref("11", "o/r"), ("o/r", 11))
-        self.assertEqual(parse_pr_ref("#11", "o/r"), ("o/r", 11))
+        self.assertEqual(parse_pr_ref("42", "o/r"), ("o/r", 42))
+        self.assertEqual(parse_pr_ref("#42", "o/r"), ("o/r", 42))
         self.assertEqual(parse_pr_ref("x/y#4", "o/r"), ("x/y", 4))
         self.assertEqual(parse_pr_ref("<https://github.com/owner/repo/pull/9>", None),
                          ("owner/repo", 9))
 
     def test_bad_refs(self):
         with self.assertRaises(ValueError):
-            parse_pr_ref("eleven", "o/r")
+            parse_pr_ref("forty-two", "o/r")
         with self.assertRaises(ValueError):
-            parse_pr_ref("11", None)
+            parse_pr_ref("42", None)
 
 
 if __name__ == "__main__":

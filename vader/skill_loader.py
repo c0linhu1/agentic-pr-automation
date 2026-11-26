@@ -7,7 +7,7 @@ from pathlib import Path
 import yaml
 
 FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n(.*)\Z", re.S)
-ACTIVATE_SECTION = re.compile(r"^## When to Activate\n.*?(?=^## )", re.S | re.M)
+ACTIVATE_SECTION = re.compile(r"^## When to Activate\n.*?(?=^## |\Z)", re.S | re.M)
 SCOPE_SECTION = re.compile(r"^## Scope\n(.*?)(?=^## |\Z)", re.S | re.M)
 CATEGORY_ROW = re.compile(r"^\|\s*([a-z][a-z0-9-]*)\s*\|", re.M)  # a lowercase name in the first column
 
@@ -32,6 +32,8 @@ def load_skill(skill_dir: Path) -> Skill:
     if not m:
         raise ValueError(f"{skill_dir}/SKILL.md has no frontmatter")
     meta = yaml.safe_load(m.group(1))
+    if not isinstance(meta, dict) or not meta.get("name") or not meta.get("description"):
+        raise ValueError(f"{skill_dir}/SKILL.md's frontmatter needs a name and a description")
     body = ACTIVATE_SECTION.sub("", m.group(2)).strip()
 
     refs_dir = skill_dir / "references"

@@ -66,6 +66,15 @@ class ReportTests(unittest.TestCase):
         self.assertIn("`api/search.py:3`", text)
         self.assertIn("Use parameters.", text)
 
+    def test_hidden_and_malformed_findings_are_counted_and_errors_stay_in_one_row(self):
+        r = done_review()
+        r.results[0].update(omitted=4, dropped=1)
+        r.results[1]["error"] = "part 1: timed out\npart 2: bad | reply"
+        text = report.markdown(r)
+        self.assertIn("| Security Validator | 1 finding(s), and 4 lower-severity one(s) not shown "
+                      "(1 malformed finding(s) dropped) |", text)
+        self.assertIn("| QA Validator | ⚠️ failed: part 1: timed out part 2: bad / reply |", text)
+
     def test_slack_report(self):
         text = fmt.verdict(done_review().summary())
         self.assertIn("*Verdict: BLOCK*", text)

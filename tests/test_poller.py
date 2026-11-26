@@ -39,12 +39,12 @@ class CloseLinkedIssuesTests(unittest.TestCase):
         return self.poller.sync_closed_prs()
 
     def test_a_merged_pr_closes_its_issue_as_completed(self):
-        gh = FakeGitHub([closed_pr(16, "Fixes #15", "2026-10-20T12:00:00Z")], [issue(15)])
+        gh = FakeGitHub([closed_pr(40, "Fixes #15", "2026-10-20T12:00:00Z")], [issue(15)])
         self.assertEqual(self.sync(gh), 1)
         self.assertEqual(gh.closes, [(15, {"state": "closed", "state_reason": "completed"})])
-        self.assertEqual(gh.comments, [(15, "Closed by Vader: #16 was merged into `staging`.")])
+        self.assertEqual(gh.comments, [(15, "Closed by Vader: #40 was merged into `staging`.")])
         event, = [e for e in self.events.since(0) if e["type"] == "issue_closed"]
-        self.assertEqual((event["issue"], event["pr"], event["merged"]), (15, 16, True))
+        self.assertEqual((event["issue"], event["pr"], event["merged"]), (15, 40, True))
 
     def test_a_pr_closed_without_merging_closes_its_issue_as_not_planned(self):
         gh = FakeGitHub([closed_pr(7, "Closes #1", "2026-10-19T10:00:00Z", merged=False)], [issue(1)])
@@ -53,7 +53,7 @@ class CloseLinkedIssuesTests(unittest.TestCase):
         self.assertIn("closed without being merged", gh.comments[0][1])
 
     def test_a_pr_replaced_by_an_open_one_leaves_its_issues_to_it(self):
-        # #7 and #8 were combined into the open #18, which still says "Closes #1, #2"; #9's issue #3 isn't in it.
+        # #7 and #8 were combined into the open #42, which still says "Closes #1, #2"; #9's issue #3 isn't in it.
         gh = FakeGitHub([closed_pr(7, "Closes #1", "2026-10-19T10:00:00Z", merged=False),
                          closed_pr(8, "Closes #2", "2026-10-19T11:00:00Z", merged=False),
                          closed_pr(9, "Closes #3", "2026-10-19T12:00:00Z", merged=False)], [issue(1), issue(2), issue(3)])
@@ -61,8 +61,8 @@ class CloseLinkedIssuesTests(unittest.TestCase):
         self.assertEqual(self.sync(gh), 1)
         self.assertEqual([n for n, _ in gh.closes], [3])
         self.assertEqual(gh.open_reads, 1)  # listed once, not per PR
-        gh.pr.update(state="closed", merged=True)  # when #18 merges, it closes them as completed
-        gh.prs.append(dict(closed_pr(18, gh.pr["body"], "2026-10-21T09:00:00Z")))
+        gh.pr.update(state="closed", merged=True)  # when #42 merges, it closes them as completed
+        gh.prs.append(dict(closed_pr(42, gh.pr["body"], "2026-10-21T09:00:00Z")))
         self.assertEqual(self.sync(gh), 2)
         self.assertEqual(gh.closes[1:], [(1, {"state": "closed", "state_reason": "completed"}),
                                          (2, {"state": "closed", "state_reason": "completed"})])
@@ -81,7 +81,7 @@ class CloseLinkedIssuesTests(unittest.TestCase):
 
     def test_catches_up_once_then_only_handles_newly_closed_prs(self):
         gh = FakeGitHub([closed_pr(7, "Closes #1", "2026-10-19T10:00:00Z", merged=False),
-                         closed_pr(16, "Closes #15", "2026-10-20T12:00:00Z")], [issue(1), issue(15)])
+                         closed_pr(40, "Closes #15", "2026-10-20T12:00:00Z")], [issue(1), issue(15)])
         self.assertEqual(self.sync(gh), 2)
         gh.issues[15]["state"] = "open"  # a person reopens it: Vader must not close it again
         self.assertEqual(self.sync(gh), 0)
@@ -92,7 +92,7 @@ class CloseLinkedIssuesTests(unittest.TestCase):
         self.assertEqual(self.state.issues_synced_through("o/r"), "2026-10-21T09:00:00Z")
 
     def test_where_it_got_to_survives_a_restart(self):
-        gh = FakeGitHub([closed_pr(16, "Closes #15", "2026-10-20T12:00:00Z")], [issue(15)])
+        gh = FakeGitHub([closed_pr(40, "Closes #15", "2026-10-20T12:00:00Z")], [issue(15)])
         self.sync(gh)
         gh.issues[15]["state"] = "open"
         self.poller.state = State(Path(self.tmp.name) / "state.json")
@@ -108,7 +108,7 @@ class CloseLinkedIssuesTests(unittest.TestCase):
         self.assertEqual(gh.pages, [1])
 
     def test_a_refused_close_is_retried_on_the_next_check(self):
-        gh = FakeGitHub([closed_pr(16, "Closes #15", "2026-10-20T12:00:00Z")], [issue(15)])
+        gh = FakeGitHub([closed_pr(40, "Closes #15", "2026-10-20T12:00:00Z")], [issue(15)])
         gh.close_reply = response(403, {"message": "Resource not accessible by personal access token"})
         with self.assertRaisesRegex(RuntimeError, "Issues: Read and write"):
             self.sync(gh)
@@ -118,7 +118,7 @@ class CloseLinkedIssuesTests(unittest.TestCase):
 
     def test_a_github_outage_keeps_the_prs_already_handled(self):
         gh = FakeGitHub([closed_pr(7, "Closes #1", "2026-10-19T10:00:00Z"),
-                         closed_pr(16, "Closes #15", "2026-10-20T12:00:00Z")], [issue(1), issue(15)])
+                         closed_pr(40, "Closes #15", "2026-10-20T12:00:00Z")], [issue(1), issue(15)])
         patch = gh.patch
         gh.patch = lambda path, json, **kw: (response(502, {}) if path.endswith("/15") else patch(path, json))
         with self.assertRaises(RuntimeError):
@@ -129,7 +129,7 @@ class CloseLinkedIssuesTests(unittest.TestCase):
         self.assertEqual([n for n, _ in gh.closes], [1, 15])
 
     def test_an_issue_github_wont_close_is_reported_and_skipped(self):
-        gh = FakeGitHub([closed_pr(16, "Closes #15", "2026-10-20T12:00:00Z")], [issue(15)])
+        gh = FakeGitHub([closed_pr(40, "Closes #15", "2026-10-20T12:00:00Z")], [issue(15)])
         gh.close_reply = response(422, {"message": "Validation Failed"})
         self.assertEqual(self.sync(gh), 0)
         self.assertEqual(self.state.issues_synced_through("o/r"), "2026-10-20T12:00:00Z")
@@ -209,6 +209,15 @@ class PrPollTests(unittest.TestCase):
             errors = [e for e in events.since(0) if e["type"] == "poller_error"]
             self.assertEqual(len(errors), 1)
             self.assertIn("o/r#1", errors[0]["message"])
+
+    def test_every_page_of_open_prs_is_read(self):
+        prs = [{"number": n} for n in range(1, 151)]
+
+        def get(path, params):
+            start = (params["page"] - 1) * params["per_page"]
+            return response(200, prs[start:start + params["per_page"]])
+
+        self.assertEqual(GitHubPoller._open_prs(mock.Mock(get=get), "o/r"), prs)
 
     def test_nothing_is_queued_while_the_model_server_is_down(self):
         poller = GitHubPoller(mock.Mock(), Events(), mock.Mock())

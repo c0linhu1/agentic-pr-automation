@@ -14,6 +14,7 @@ import httpx
 
 from . import config, models, report
 from .agents import VALIDATORS
+from .decision import PASS
 from .diffs import FileDiff, split_files
 from .engine import Engine, Events, Review, Stopped
 from .skips import filter_files, generated_source_changed, has_generated_banner, needs_person, unsafe_skips
@@ -29,25 +30,25 @@ CHECK_RUN_PAGES = 10        # most pages of check runs read per commit (100 each
 BANNER_CHECKS = 20          # files named like generated code whose banner is checked before a merge
 BANNER_LINES = 10           # how far into a file a generator banner is looked for
 PR_FILE_PAGES = 30          # GitHub lists at most 3000 of a PR's files, 100 a page
+PR_LIST_PAGES = 10          # most pages of a repo's open or closed PRs read (100 each)
 
-CLOSED_PR_PAGES = 10        # most pages of closed PRs read per repo (100 each); only the first check needs more than one
 LINKED_ISSUE = re.compile(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+#(\d+)")
 PR_URL = re.compile(r"github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 PR_REF = re.compile(r"^(?:([\w.-]+/[\w.-]+))?#?(\d+)$")
 
 
 def parse_pr_ref(ref: str, default_repo: str | None) -> tuple[str, int]:
-    """'11', '#11', 'owner/repo#11', or a PR URL -> (repo, number)."""
+    """'42', '#42', 'owner/repo#42', or a PR URL -> (repo, number)."""
     ref = ref.strip().strip("<>")
     m = PR_URL.search(ref)
     if m:
         return m.group(1), int(m.group(2))
     m = PR_REF.match(ref)
     if not m:
-        raise ValueError(f"`{ref}` isn't a PR: use a number like 11, owner/repo#11, or the PR's URL")
+        raise ValueError(f"`{ref}` isn't a PR: use a number like 42, owner/repo#42, or the PR's URL")
     repo = m.group(1) or default_repo
     if not repo:
-        raise ValueError("no repo given and GITHUB_REPOS is empty: use owner/repo#11")
+        raise ValueError("no repo given and GITHUB_REPOS is empty: use owner/repo#42")
     return repo, int(m.group(2))
 
 
@@ -162,9 +163,7 @@ class GitHubPoller:
         queued = 0
         with self._client() as gh:
             for repo in config.GITHUB_REPOS:
-                prs = gh.get(f"/repos/{repo}/pulls", params={"state": "open", "per_page": 50})
-                prs.raise_for_status()
-                for pr in prs.json():
+                for pr in self._open_prs(gh, repo):
                     if pr.get("draft") and not config.REVIEW_DRAFTS:
                         continue
                     pr_key, sha = f"{repo}#{pr['number']}", pr["head"]["sha"]
@@ -182,6 +181,18 @@ class GitHubPoller:
                     self.engine.submit(review)
                     queued += 1
         return queued
+
+    @staticmethod
+    def _open_prs(gh: httpx.Client, repo: str) -> list[dict]:
+        prs = []
+        for page in range(1, PR_LIST_PAGES + 1):
+            r = gh.get(f"/repos/{repo}/pulls", params={"state": "open", "per_page": 100, "page": page})
+            r.raise_for_status()
+            batch = r.json()
+            prs += batch
+            if len(batch) < 100:
+                break
+        return prs
 
     def sync_closed_prs(self) -> int:
         """Close the issues linked from PRs closed since the last check, merged or not. Returns how many."""
@@ -210,7 +221,7 @@ class GitHubPoller:
         """PRs closed after `since` (every recent one when None). Newest-updated first, so after the first
         check one page is enough: anything closed since has been updated since."""
         found = []
-        for page in range(1, CLOSED_PR_PAGES + 1):
+        for page in range(1, PR_LIST_PAGES + 1):
             r = gh.get(f"/repos/{repo}/pulls", params={"state": "closed", "sort": "updated", "direction": "desc",
                                                        "per_page": 100, "page": page})
             r.raise_for_status()
@@ -220,18 +231,9 @@ class GitHubPoller:
                 break
         return found
 
-    @staticmethod
-    def _open_pr_links(gh: httpx.Client, repo: str) -> set[int]:
+    def _open_pr_links(self, gh: httpx.Client, repo: str) -> set[int]:
         """Issues linked ("Closes #12") from the repo's open PRs."""
-        links = set()
-        for page in range(1, CLOSED_PR_PAGES + 1):
-            r = gh.get(f"/repos/{repo}/pulls", params={"state": "open", "per_page": 100, "page": page})
-            r.raise_for_status()
-            batch = r.json()
-            links.update(n for p in batch for n in linked_issues(p.get("body")))
-            if len(batch) < 100:
-                return links
-        return links
+        return {n for p in self._open_prs(gh, repo) for n in linked_issues(p.get("body"))}
 
     def _close_issue(self, gh: httpx.Client, repo: str, number: int, pr: dict) -> int:
         """Close one linked issue with a comment saying why; 1 if closed. A refused close raises, so the
@@ -256,7 +258,8 @@ class GitHubPoller:
         closing.raise_for_status()
         how = f"was merged into `{pr['base']['ref']}`" if merged else "was closed without being merged"
         # Closed first, then the comment: a failed comment must not leave the issue open or post twice.
-        note = gh.post(f"/repos/{repo}/issues/{number}/comments", json={"body": f"Closed by Vader: #{pr['number']} {how}."})
+        note = gh.post(f"/repos/{repo}/issues/{number}/comments",
+                       json={"body": f"Closed by Vader: #{pr['number']} {how}."})
         if note.status_code >= 400:
             log.warning("closed %s#%s but couldn't comment (%s)", repo, number, note.status_code)
         self.events.add("issue_closed", repo=repo, issue=number, title=issue["title"], url=issue["html_url"],
@@ -330,7 +333,7 @@ class GitHubPoller:
     def merge_if_passed(self, review: Review) -> None:
         """Merge a PR into AUTO_MERGE_BRANCH after a PASS; sets review.merge and tells front-ends."""
         meta, branch = review.meta, config.AUTO_MERGE_BRANCH
-        if not (branch and config.GITHUB_TOKEN and meta.get("number") and review.verdict == "PASS"):
+        if not (branch and config.GITHUB_TOKEN and meta.get("number") and review.verdict == PASS):
             return
         try:
             with self._client() as gh:
@@ -342,16 +345,20 @@ class GitHubPoller:
         self.events.add("pr_merge", review=review.summary(), status=status, message=message)
 
     @staticmethod
-    def _first_lines(gh: httpx.Client, repo: str, ref: str, path: str) -> str | None:
-        """The file's first lines at this commit; None when it doesn't exist there, "" when unreadable."""
+    def _raw_file(gh: httpx.Client, repo: str, ref: str, path: str) -> httpx.Response | None:
+        """The file at this commit, as raw text; None if GitHub couldn't be reached."""
         try:
-            r = gh.get(f"/repos/{repo}/contents/{quote(path)}", params={"ref": ref},
-                       headers={"Accept": "application/vnd.github.raw+json"})
+            return gh.get(f"/repos/{repo}/contents/{quote(path)}", params={"ref": ref},
+                          headers={"Accept": "application/vnd.github.raw+json"})
         except httpx.HTTPError:
-            return ""
-        if r.status_code == 404:
             return None
-        return "\n".join(r.text.splitlines()[:BANNER_LINES]) if r.status_code == 200 else ""
+
+    def _first_lines(self, gh: httpx.Client, repo: str, ref: str, path: str) -> str | None:
+        """The file's first lines at this commit; None when it doesn't exist there, "" when unreadable."""
+        r = self._raw_file(gh, repo, ref, path)
+        if r is None or r.status_code not in (200, 404):
+            return ""
+        return "\n".join(r.text.splitlines()[:BANNER_LINES]) if r.status_code == 200 else None
 
     def _really_generated(self, gh: httpx.Client, repo: str, pr: dict, path: str, reviewed: set[str]) -> bool:
         """A file skipped for its generated-looking name is safe to merge unread when it starts with a
@@ -367,11 +374,6 @@ class GitHubPoller:
         if base is not None and not has_generated_banner(base):
             return False  # the banner was added in this PR
         return generated_source_changed(path, reviewed)
-
-    @staticmethod
-    def _unread_why(reason: str) -> str:
-        return ("named like generated code, but it doesn't start with a generator's banner, the banner is new, "
-                "or it's a new file whose source isn't in this PR") if reason == "generated" else reason
 
     @staticmethod
     def _behind_by(gh: httpx.Client, repo: str, branch: str, sha: str) -> int | None:
@@ -399,9 +401,13 @@ class GitHubPoller:
             return None
         return None  # more files than GitHub lists
 
-    def _unread(self, review: Review, skip: str, generated_ok: Callable[[str], bool]) -> tuple[str, str]:
+    @staticmethod
+    def _unread(review: Review, skip: str, generated_ok: Callable[[str], bool]) -> tuple[str, str]:
+        generated = ("named like generated code, but it doesn't start with a generator's banner, the banner is "
+                     "new, or it's a new file whose source isn't in this PR")
         unread = unsafe_skips(review.skipped_files, generated_ok)
-        files = ", ".join(f"`{s['path']}` ({self._unread_why(s['reason'])})" for s in unread[:10])
+        files = ", ".join(f"`{s['path']}` ({generated if s['reason'] == 'generated' else s['reason']})"
+                          for s in unread[:10])
         more = f" and {len(unread) - 10} more" if len(unread) > 10 else ""
         return "skipped", skip + (f"some files weren't reviewed, and why they were skipped doesn't rule out "
                                   f"hand-written or tampered code: {files}{more}. Check them and merge by hand.")
@@ -440,7 +446,9 @@ class GitHubPoller:
         named = [s["path"] for s in review.skipped_files if s["reason"] == "generated"][:BANNER_CHECKS]
         if named:
             reviewed = {f.path for f in split_files(review.diff)} - {s["path"] for s in review.skipped_files}
-            ok = lambda path: path in named and self._really_generated(gh, repo, pr, path, reviewed)  # noqa: E731
+            def ok(path):
+                return path in named and self._really_generated(gh, repo, pr, path, reviewed)
+
             if unsafe_skips(review.skipped_files, ok):
                 return self._unread(review, skip, ok)
         if held := self.state.held_reason(review.meta.get("pr_key", f"{repo}#{number}"), sha):
@@ -497,12 +505,13 @@ class GitHubPoller:
     def _pr_for_merge(gh: httpx.Client, repo: str, number: int) -> dict:
         """The PR as it is now. GitHub works out `mergeable` in the background (null until it's done)."""
         for attempt in range(MERGEABLE_CHECKS):
+            if attempt:
+                time.sleep(2)
             r = gh.get(f"/repos/{repo}/pulls/{number}")
             r.raise_for_status()
             pr = r.json()
-            if pr.get("mergeable") is not None or pr.get("state") != "open" or attempt == MERGEABLE_CHECKS - 1:
-                return pr
-            time.sleep(2)
+            if pr.get("mergeable") is not None or pr.get("state") != "open":
+                break
         return pr
 
     def review_for_pr(self, repo: str, number: int) -> Review:
@@ -542,12 +551,8 @@ class GitHubPoller:
         kept, _ = filter_files(changed)
         contents = {}
         for f in kept[:CONTEXT_MAX_FILES]:
-            try:
-                c = gh.get(f"/repos/{repo}/contents/{quote(f.path)}", params={"ref": sha},
-                           headers={"Accept": "application/vnd.github.raw+json"})
-            except httpx.HTTPError:
-                continue
-            if c.status_code == 200 and len(c.text) <= CONTEXT_MAX_CHARS and "\x00" not in c.text:
+            c = GitHubPoller._raw_file(gh, repo, sha, f.path)
+            if c is not None and c.status_code == 200 and len(c.text) <= CONTEXT_MAX_CHARS and "\x00" not in c.text:
                 contents[f.path] = c.text
         return contents
 

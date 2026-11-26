@@ -10,8 +10,8 @@ from vader.github import GitHubPoller
 
 def passed_review(**changes) -> Review:
     r = Review(source="github", validators=list(VALIDATORS), title="Add order search",
-               meta={"repo": "o/r", "number": 18, "sha": SHA, "pr_key": "o/r#18",
-                     "url": "https://github.com/o/r/pull/18"})
+               meta={"repo": "o/r", "number": 42, "sha": SHA, "pr_key": "o/r#42",
+                     "url": "https://github.com/o/r/pull/42"})
     r.status, r.verdict, r.verdict_reason = "done", "PASS", "no findings above info; no CI results"
     r.started, r.finished, r.model = 100.0, 160.0, "m:1b"
     for k, v in changes.items():
@@ -37,7 +37,7 @@ class AutoMergeTests(unittest.TestCase):
 
     def test_a_passing_pr_is_merged_at_the_reviewed_commit(self):
         result = self.merge()
-        self.assertEqual(self.gh.merges, [("/repos/o/r/pulls/18/merge", {"sha": SHA, "merge_method": "merge"})])
+        self.assertEqual(self.gh.merges, [("/repos/o/r/pulls/42/merge", {"sha": SHA, "merge_method": "merge"})])
         self.assertEqual(result["status"], "merged")
         self.assertIn("Merged into `staging`", result["message"])
         event, = [e for e in self.events.since(0) if e["type"] == "pr_merge"]
@@ -90,7 +90,7 @@ class AutoMergeTests(unittest.TestCase):
         answers = iter([None, None, False])
         get = self.gh.get
         self.gh.get = lambda path, **kw: (response(200, dict(self.gh.pr, mergeable=next(answers)))
-                                          if path.endswith("/pulls/18") else get(path, **kw))
+                                          if path.endswith("/pulls/42") else get(path, **kw))
         self.assertEqual(self.merge()["status"], "conflict")
 
     def test_github_refusing_the_merge(self):
@@ -198,7 +198,7 @@ class AutoMergeTests(unittest.TestCase):
         with mock.patch.object(config, "GITHUB_COMMENT", True):
             self.poller.finish(passed_review())
         (number, body), = self.gh.comments
-        self.assertEqual(number, 18)
+        self.assertEqual(number, 42)
         self.assertIn("merge conflicts with `staging`", body)
 
 

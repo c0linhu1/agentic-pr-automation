@@ -40,6 +40,14 @@ class OllamaLoadTests(unittest.TestCase):
             with self.assertRaises(models.ModelServerDown):
                 models.ensure_only("m:1b")
 
+    def test_a_reply_about_loaded_models_that_cant_be_read_means_unknown(self):
+        request = httpx.Request("GET", "http://ollama/api/ps")
+        for reply in [httpx.Response(200, text="<html>proxy error</html>", request=request),
+                      httpx.Response(200, json={"models": [{"size": 1}]}, request=request),
+                      httpx.Response(200, json=["not", "a", "dict"], request=request)]:
+            with self.subTest(reply=reply.text), mock.patch.object(models.httpx, "get", return_value=reply):
+                self.assertIsNone(models.loaded())
+
     def test_unloading_from_a_server_that_is_gone_is_not_an_error(self):
         with mock.patch.object(models.httpx, "post", side_effect=httpx.ConnectError("refused")):
             models.unload("m:1b")

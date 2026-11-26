@@ -1,10 +1,12 @@
 """Turns Vader's replies and events into Slack messages."""
 SEV_ICON = {"critical": ":red_circle:", "high": ":large_orange_circle:", "medium": ":large_yellow_circle:",
             "low": ":white_circle:", "info": ":information_source:"}
-VERDICT_ICON = {"BLOCK": ":no_entry:", "HOLD": ":raised_hand:", "MINOR": ":large_yellow_circle:", "PASS": ":white_check_mark:"}
+VERDICT_ICON = {"BLOCK": ":no_entry:", "HOLD": ":raised_hand:", "MINOR": ":large_yellow_circle:",
+                "PASS": ":white_check_mark:"}
 MERGE_ICON = {"merged": ":twisted_rightwards_arrows:", "conflict": ":x:", "skipped": ":double_vertical_bar:",
               "failed": ":warning:"}
-LIMIT = 39_000
+LIMIT = 39_000  # Slack takes up to 40,000 characters a message
+REPORT_TOP = 8  # most serious findings repeated in the end-of-review report
 
 HELP = """*Vader* runs six validators on a change and gives a verdict. Commands:
 `/vader status` · `/vader stop` · `/vader start`
@@ -18,7 +20,8 @@ Input can be a bare diff, or labeled sections (new lines with Shift+Enter):
 
 
 def unescape(text: str) -> str:
-    """Slack sends &, <, and > in message and command text as &amp;, &lt;, and &gt;; pasted code needs them back."""
+    """Slack sends &, <, and > in message and command text as &amp;, &lt;, and &gt;; pasted code needs them
+    back."""
     return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 
 
@@ -44,11 +47,11 @@ def status(s: dict) -> str:
         lines.append("Loaded: " + (", ".join(f"`{m['name']}` ({m['size_gb']} GB)" for m in loaded) or "nothing yet"))
     run = s.get("running")
     if run:
-        lines.append(f":gear: Reviewing _{esc(run['title'] or run['id'])}_: {run['done']}/{run['total']} validators done"
-                     f"{', now ' + run['current'] if run['current'] else ''} · {minutes(run['elapsed_s'])}"
+        lines.append(f":gear: Reviewing _{esc(run['title'] or run['id'])}_: {run['done']}/{run['total']} validators "
+                     f"done{', now ' + run['current'] if run['current'] else ''} · {minutes(run['elapsed_s'])}"
                      + (f" of ~{minutes(run['estimate_s'])}" if run.get("estimate_s") else ""))
-    lines.append(f"Queue: {len(s['queue'])} waiting" + "".join(f"\n  • _{esc(q['title'] or q['id'])}_ ({q['source']})"
-                                                           for q in s["queue"]))
+    queued = "".join(f"\n  • _{esc(q['title'] or q['id'])}_ ({q['source']})" for q in s["queue"])
+    lines.append(f"Queue: {len(s['queue'])} waiting{queued}")
     gh = s["github"]
     lines.append("GitHub: " + (", ".join(gh["repos"]) if gh["configured"] else "not configured"))
     lines.append("Auto-merge: " + (f"PASS → `{esc(s['auto_merge'])}`" if s.get("auto_merge") else "off")
@@ -121,10 +124,10 @@ def estimate(estimate_s: float, limit_s: float | None, calls: int) -> str:
 
 
 def validator_result(r: dict) -> str:
-    if r["status"] == "failed":
-        return (f":warning: Review FAILED: {esc(r['error'])}. This counts as missing evidence, not a clean review."
-                + (f" · `{r['model']}`" if r.get("model") else ""))
     model = f" · `{r['model']}`" if r.get("model") else ""
+    if r["status"] == "failed":
+        return (f":warning: Review FAILED: {esc(r['error'])}. This counts as missing evidence, not a clean "
+                f"review.{model}")
     if not r["findings"]:
         text = f":white_check_mark: No findings{model}"
     else:
@@ -133,13 +136,14 @@ def validator_result(r: dict) -> str:
             loc = f.get("file") or "PR-level"
             if f.get("line"):
                 loc += f":{f['line']}"
-            lines.append(f"{SEV_ICON[f['severity']]} *{f['severity']}* `{esc(f.get('category', '?'))}` {esc(loc)}\n"
-                         f"{esc(f['description'])}")
+            lines.append(f"{SEV_ICON[f['severity']]} *{f['severity']}* `{esc(f.get('category', '?'))}` "
+                         f"{esc(loc)}\n{esc(f['description'])}")
             if f.get("suggestedFix"):
                 lines.append(f"    _fix:_ {esc(f['suggestedFix'])}")
         text = "\n".join(lines)
     for x in r.get("rejected") or []:
-        text += f"\n:wastebasket: _Dropped after checking ({x['severity']}): {esc(x['description'][:150])} Reason: {esc(x['reason'])}_"
+        text += (f"\n:wastebasket: _Dropped after checking ({x['severity']}): {esc(x['description'][:150])} "
+                 f"Reason: {esc(x['reason'])}_")
     if r.get("omitted"):
         text += f"\n_{r['omitted']} lower-severity finding(s) not shown_"
     if r.get("dropped"):
@@ -149,9 +153,6 @@ def validator_result(r: dict) -> str:
     if r.get("note"):
         text += f"\n:information_source: {esc(r['note'][0].upper() + r['note'][1:])}"
     return cut(text)
-
-
-REPORT_TOP = 8  # most serious findings repeated in the report
 
 
 def verdict(review: dict) -> str:

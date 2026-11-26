@@ -1,5 +1,6 @@
-"""Parses and validates validator output against the shared Finding schema.
-Output that doesn't parse counts as a FAILED review, never as a clean one."""
+"""What happens to a validator's reply, in order: parse it against the Finding schema (a reply that doesn't
+parse is a FAILED review, never a clean one), check each finding's quote against the code it was shown,
+then, with repeated asks, combine the asks' findings."""
 import copy
 import json
 import re
@@ -161,30 +162,6 @@ def _find(evidence: str, quote: list[set[str]], lines: list[CodeLine], near: int
     return True, next((c for c in numbered if c.changed), numbered[0]).number
 
 
-SAME_ISSUE_LINES = 3  # two asks pointing within this many lines of each other in a file mean the same thing
-
-
-def _same_issue(a: dict, b: dict) -> bool:
-    if a.get("file") != b.get("file"):
-        return False
-    if a.get("line") and b.get("line"):
-        return abs(a["line"] - b["line"]) <= SAME_ISSUE_LINES
-    return a.get("category") == b.get("category")
-
-
-def agreed(findings: list[dict], asks: int) -> list[dict]:
-    """With several asks (each finding tagged `_ask`), marks `_verify` a finding below high that most asks
-    didn't report: it may be a one-off false alarm, so the verify pass re-checks it rather than it being
-    dropped (a real bug is sometimes caught by one ask only). Critical and high ones are re-checked anyway."""
-    if asks < 2:
-        return findings
-    for f in findings:
-        if (f["severity"] not in ("critical", "high")
-                and len({g.get("_ask") for g in findings if _same_issue(f, g)}) <= asks // 2):
-            f["_verify"] = True
-    return findings
-
-
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
 _DAY = r"(?P<day>(?:mon|tues|wednes|thurs|fri|satur|sun)day)"
@@ -247,8 +224,15 @@ def ground(finding: dict, code: dict[str, tuple[list[CodeLine], list[CodeLine]]]
                     finding["line"] = line
                 return None
     # A quote that joins lines from several files (a setting and the code that reads it): each line must be in one
-    where = [next(((p, c) for p in order for lines in code[p] for c in lines if any(v and v in c.text for v in q)),
-                  None) for q in quote]
+    def first_place(q):
+        for p in order:
+            for lines in code[p]:
+                for c in lines:
+                    if any(v and v in c.text for v in q):
+                        return p, c
+        return None
+
+    where = [first_place(q) for q in quote]
     if len(quote) > 1 and all(where):
         p, c = where[0]
         finding["file"] = p
@@ -259,3 +243,45 @@ def ground(finding: dict, code: dict[str, tuple[list[CodeLine], list[CodeLine]]]
         return None
     return (f"the code it quotes isn't in {path}" if path else
             f"the code it quotes isn't in the PR{f' (it names {named})' if named else ''}")
+
+
+SAME_ISSUE_LINES = 3  # two asks pointing within this many lines of each other in a file mean the same thing
+
+
+def _same_issue(a: dict, b: dict) -> bool:
+    if a.get("file") != b.get("file"):
+        return False
+    if a.get("line") and b.get("line"):
+        return abs(a["line"] - b["line"]) <= SAME_ISSUE_LINES
+    return a.get("category") == b.get("category")
+
+
+def agreed(findings: list[dict], asks: int) -> list[dict]:
+    """With several asks (each finding tagged `_ask`), marks `_verify` a finding below high that most asks
+    didn't report: it may be a one-off false alarm, so the verify pass re-checks it rather than it being
+    dropped (a real bug is sometimes caught by one ask only). Critical and high ones are re-checked anyway."""
+    if asks < 2:
+        return findings
+    for f in findings:
+        if (f["severity"] not in ("critical", "high")
+                and len({g.get("_ask") for g in findings if _same_issue(f, g)}) <= asks // 2):
+            f["_verify"] = True
+    return findings
+
+
+def merge_asks(findings: list[dict]) -> list[dict]:
+    """One finding per issue across repeated asks: copies of it from other asks of the same part become the
+    most severe copy, as that copy wrote it. Two findings from the same ask are never merged. When a finding
+    could join several, it joins the one with the closest line."""
+    def gap(f, g):
+        return abs(f["line"] - g["line"]) if f.get("line") and g.get("line") else 0
+
+    kept: list[tuple[dict, set]] = []  # (the copy kept, the asks merged into it)
+    for f in sorted(findings, key=lambda f: SEVERITIES.index(f["severity"])):
+        match = min((k for k in kept if k[0].get("_part") == f.get("_part") and f.get("_ask") not in k[1]
+                     and _same_issue(f, k[0])), key=lambda k: gap(f, k[0]), default=None)
+        if match:
+            match[1].add(f.get("_ask"))
+        else:
+            kept.append((f, {f.get("_ask")}))
+    return [f for f, _ in kept]

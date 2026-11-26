@@ -108,11 +108,11 @@ PASSED = [{"name": "build-test", "status": "completed", "conclusion": "success"}
 
 
 class FakeGitHub:
-    """One repo, o/r: an open PR #18 into staging, closed PRs, issues, and CI checks. Records what Vader
+    """One repo, o/r: an open PR #42 into staging, closed PRs, issues, and CI checks. Records what Vader
     writes; a test changes the data or the replies to closing and merging."""
 
     def __init__(self, closed_prs=(), issues=()):
-        self.pr = {"number": 18, "title": "Add order search", "state": "open", "merged": False, "draft": False,
+        self.pr = {"number": 42, "title": "Add order search", "state": "open", "merged": False, "draft": False,
                    "mergeable": True, "base": {"ref": "staging", "sha": "base000"}, "head": {"ref": "add-order-search", "sha": SHA}}
         self.prs, self.issues = list(closed_prs), {i["number"]: i for i in issues}
         self.checks = PASSED

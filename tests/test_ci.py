@@ -40,14 +40,14 @@ class CiInVerdictTests(EngineCase):
 class AttachCiTests(unittest.TestCase):
     def test_reads_check_runs_for_the_commit(self):
         use_github(self).checks = [{"name": "build-test", "status": "completed", "conclusion": "success", "extra": 1}]
-        review = Review(source="github", validators=["qa"], meta={"repo": "o/r", "sha": "abc", "pr_key": "o/r#18"})
+        review = Review(source="github", validators=["qa"], meta={"repo": "o/r", "sha": "abc", "pr_key": "o/r#42"})
         GitHubPoller(mock.Mock(), Events(), mock.Mock()).attach_ci(review)
         self.assertEqual(review.ci, [run("build-test", "success")])
 
     def test_a_failure_past_the_first_page_is_still_seen(self):
         # A big matrix build: the one failing check is number 150, on GitHub's second page.
         use_github(self).checks = [run(f"job {i}", "success") for i in range(149)] + [run("job 149", "failure")]
-        review = Review(source="github", validators=["qa"], meta={"repo": "o/r", "sha": "abc", "pr_key": "o/r#18"})
+        review = Review(source="github", validators=["qa"], meta={"repo": "o/r", "sha": "abc", "pr_key": "o/r#42"})
         GitHubPoller(mock.Mock(), Events(), mock.Mock()).attach_ci(review)
         self.assertEqual((len(review.ci), review.ci_status), (150, "failed"))
         with mock.patch("vader.github.CHECK_RUN_PAGES", 1), self.assertLogs("vader.github", "WARNING"):

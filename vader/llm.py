@@ -17,6 +17,10 @@ class LlmUnavailable(LlmError, models.ModelServerDown):
     """The model server couldn't be reached, so nothing was reviewed."""
 
 
+class OutputLimit(LlmError):
+    """The model used the whole reply budget (usually on thinking) before it answered."""
+
+
 # Code runs about 2.4-2.7 characters per token, prose about 4. Assume the densest, so the
 # estimate errs high; characters outside ASCII (accents, CJK, emoji) count as a token each.
 CHARS_PER_TOKEN = 2.4
@@ -68,10 +72,6 @@ def prompt_tokens(instructions: str, content: str) -> int:
     return estimated_tokens(SYSTEM) + estimated_tokens(instructions) + estimated_tokens(content)
 
 
-class OutputLimit(LlmError):
-    """The model used the whole reply budget (usually on thinking) before it answered."""
-
-
 def _settings(model: str) -> tuple[str | None, float]:
     try:
         return models.reasoning_effort(model), models.temperature(model)
@@ -80,6 +80,8 @@ def _settings(model: str) -> tuple[str | None, float]:
 
 
 def complete(model: str, instructions: str, content: str, schema: dict = SCHEMA, think: bool = True) -> str:
+    """The model's reply text. Raises LlmError when the prompt doesn't fit, the call fails, or the reply
+    shows the answer or the prompt was cut short."""
     # An overflowing prompt can be cut off silently and still look clean: refuse it.
     budget = config.CONTEXT_TOKENS - config.OUTPUT_TOKENS
     needed = prompt_tokens(instructions, content)
@@ -112,7 +114,7 @@ def request(model: str, instructions: str, content: str, schema: dict = SCHEMA, 
         )
     except openai.APITimeoutError:
         raise LlmError(f"{model} timed out after {config.TIMEOUT_SECONDS:g}s") from None
-    except openai.APIConnectionError:  # after APITimeoutError, its subclass: slow isn't down
+    except openai.APIConnectionError:  # a timeout is one too, caught above: a slow server isn't a down one
         raise LlmUnavailable(f"can't reach the model server at {config.LLM_BASE_URL} -- is it running?") from None
     except openai.NotFoundError:
         raise LlmError(f"model {model} isn't available on the model server (pulled/downloaded?)") from None

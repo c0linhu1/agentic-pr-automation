@@ -71,14 +71,22 @@ def queue_review(channel: str, thread_ts: str | None, head: str, submit, queued_
     app.client.chat_update(channel=channel, ts=parent["ts"], text=text)
 
 
+def _who(validators: list[str] | None) -> str:
+    return "all six validators" if validators is None else f"the {validators[0]} validator"
+
+
 def start_pr_review(user: str, channel: str, thread_ts: str | None, ref: str, validators: list[str] | None) -> None:
     """Ask Vader to fetch one GitHub PR and review it. Vader does the fetching."""
-    who = "all six validators" if validators is None else f"the {validators[0]} validator"
+    who = _who(validators)
+
+    def queued(r):
+        m = r["meta"]
+        return (f":mag: <@{user}> asked Vader to review <{m['url']}|{m['repo']}#{m['number']}> "
+                f"_{fmt.esc(r['title'])}_ by `{fmt.esc(m['author'])}` with {who}\n"
+                f"Queued (position {r['position']}). Results will appear in this thread.")
+
     queue_review(channel, thread_ts, f":hourglass_flowing_sand: <@{user}> asked Vader to review PR `{ref}` with {who}",
-                 lambda reply_to: vader.submit_pr(ref, validators, reply_to),
-                 lambda r: (f":mag: <@{user}> asked Vader to review <{r['meta']['url']}|{r['meta']['repo']}#"
-                            f"{r['meta']['number']}> _{fmt.esc(r['title'])}_ by `{fmt.esc(r['meta']['author'])}` with {who}\n"
-                            f"Queued (position {r['position']}). Results will appear in this thread."))
+                 lambda reply_to: vader.submit_pr(ref, validators, reply_to), queued)
 
 
 def start_review(user: str, channel: str, thread_ts: str | None, text: str, validators: list[str] | None,
@@ -86,8 +94,7 @@ def start_review(user: str, channel: str, thread_ts: str | None, text: str, vali
     if not text.strip():
         private("Give me something to review: a diff, or `TITLE:` / `DESCRIPTION:` / `DIFF:` sections.")
         return
-    who = "all six validators" if validators is None else f"the {validators[0]} validator"
-    head = f":hourglass_flowing_sand: <@{user}> asked Vader to review this with {who}"
+    head = f":hourglass_flowing_sand: <@{user}> asked Vader to review this with {_who(validators)}"
     queue_review(channel, thread_ts, head, lambda reply_to: vader.submit(text, validators, reply_to),
                  lambda r: f"{head}\nQueued (position {r['position']}). Results will appear in this thread.")
 
@@ -134,7 +141,7 @@ def handle_command(text: str, user: str, channel: str, thread_ts: str | None, pr
         elif sub == "pr":
             ref, _, only = rest.partition(" ")
             if not ref:
-                private("Usage: `/vader pr <number or PR link> [validator]`, e.g. `/vader pr 11`")
+                private("Usage: `/vader pr <number or PR link> [validator]`, e.g. `/vader pr 42`")
                 return
             start_pr_review(user, channel, thread_ts, ref, [only.strip()] if only.strip() else None)
         else:
@@ -160,13 +167,18 @@ def vader_command(ack, command, respond):
 
 @app.event("app_mention")
 def on_mention(event, body):
-    if body.get("event_id") in seen_events:
-        return
-    seen_events[body.get("event_id")] = None
-    if len(seen_events) > SEEN_LIMIT:
-        seen_events.popitem(last=False)
+    event_id = body.get("event_id")
+    if event_id:
+        if event_id in seen_events:
+            return
+        seen_events[event_id] = None
+        if len(seen_events) > SEEN_LIMIT:
+            seen_events.popitem(last=False)
     channel, thread_ts = event["channel"], event.get("thread_ts") or event["ts"]
-    reply = lambda t: app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=t)  # noqa: E731
+
+    def reply(text):
+        app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+
     handle_command(LEADING_MENTIONS.sub("", event.get("text", "")), event["user"], channel, thread_ts,
                    private=reply, public=reply)
 

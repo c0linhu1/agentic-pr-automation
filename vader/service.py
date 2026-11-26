@@ -18,6 +18,8 @@ from .state import State
 
 log = logging.getLogger("vader")
 
+STOPPED = "Vader is stopped; nothing new is accepted until it's started"
+
 
 class ControlBody(BaseModel):
     action: str  # "start" | "stop"
@@ -42,7 +44,7 @@ class ReviewBody(BaseModel):
 
 
 class PrBody(BaseModel):
-    ref: str                              # "11", "#11", "owner/repo#11", or the PR's URL
+    ref: str                              # "42", "#42", "owner/repo#42", or the PR's URL
     validators: list[str] | None = None   # default: all six
     reply_to: dict | None = None
 
@@ -116,7 +118,7 @@ def create_app(state: State, events: Events, engine: Engine, poller: GitHubPolle
 
         def preload():
             try:
-                models.ensure_only(name)
+                engine.preload(name, models.ensure_only)
                 events.add("model_ready", model=name)
             except Exception as e:  # noqa: BLE001
                 events.add("model_failed", model=name, error=str(e))
@@ -137,7 +139,7 @@ def create_app(state: State, events: Events, engine: Engine, poller: GitHubPolle
         try:
             return engine.submit(review)
         except Stopped:
-            raise HTTPException(409, "Vader is stopped; nothing new is accepted until it's started") from None
+            raise HTTPException(409, STOPPED) from None
 
     @app.post("/reviews/pr", dependencies=auth)
     def submit_pr(body: PrBody):
@@ -145,8 +147,8 @@ def create_app(state: State, events: Events, engine: Engine, poller: GitHubPolle
         if poller is None or not config.GITHUB_TOKEN:
             raise HTTPException(400, "GitHub isn't configured on Vader (GITHUB_TOKEN in .env.vader)")
         keys = validator_keys(body.validators)
-        if not state.enabled:
-            raise HTTPException(409, "Vader is stopped; nothing new is accepted until it's started")
+        if not state.enabled:  # checked before fetching, so a stopped Vader doesn't call GitHub
+            raise HTTPException(409, STOPPED)
         try:
             repo, number = parse_pr_ref(body.ref, config.GITHUB_REPOS[0] if config.GITHUB_REPOS else None)
             review = poller.review_for_pr(repo, number)
@@ -219,9 +221,17 @@ def main() -> None:
              "running" if state.enabled else "STOPPED",
              "on" if state.automation else "off",
              ", ".join(config.GITHUB_REPOS) if poller.configured else "not configured")
+    _warn_about_models(state.model)
+
+    uvicorn.run(create_app(state, events, engine, poller, config.API_KEY),
+                host=config.HOST, port=config.PORT, log_level="warning")
+
+
+def _warn_about_models(active: str | None) -> None:
+    """At startup, log which model each validator uses and warn about any that won't run."""
     assigned = models.assignments()
-    in_use = {assigned.get(k, state.model) for k in VALIDATORS} - {None}
-    log.info("validator models: %s", ", ".join(f"{k}={assigned.get(k, state.model)}" for k in VALIDATORS))
+    in_use = {assigned.get(k, active) for k in VALIDATORS} - {None}
+    log.info("validator models: %s", ", ".join(f"{k}={assigned.get(k, active)}" for k in VALIDATORS))
     for k in sorted(set(assigned) - set(VALIDATORS)):
         log.warning("models.yaml assigns a model to unknown validator %r; ignored", k)
     for m in sorted(in_use):
@@ -235,9 +245,6 @@ def main() -> None:
         for m in sorted(in_use - have):
             log.warning("model %s isn't on the model server; its validators will fail until it's pulled or "
                         "downloaded there", m)
-
-    uvicorn.run(create_app(state, events, engine, poller, config.API_KEY),
-                host=config.HOST, port=config.PORT, log_level="warning")
 
 
 if __name__ == "__main__":

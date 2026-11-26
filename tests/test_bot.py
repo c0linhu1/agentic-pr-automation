@@ -24,7 +24,7 @@ class CommandTests(unittest.TestCase):
     def setUp(self):
         self.vader = self.enterContext(mock.patch.object(bot, "vader"))
         self.vader.submit_pr.return_value = {"id": "r1", "position": 1, "title": "Add search", "meta": {
-            "url": "https://github.com/o/r/pull/11", "repo": "o/r", "number": 11, "author": "dev"}}
+            "url": "https://github.com/o/r/pull/42", "repo": "o/r", "number": 42, "author": "dev"}}
         self.vader.submit.return_value = {"id": "r2", "position": 1}
         self.private, self.public = [], []
 
@@ -32,10 +32,10 @@ class CommandTests(unittest.TestCase):
         bot.handle_command(text, "U1", "C1", None, private=self.private.append, public=self.public.append)
 
     def test_pr_reviews(self):
-        self.command("pr 11")
-        self.assertEqual(self.vader.submit_pr.call_args.args[:2], ("11", None))  # all six validators
-        self.command("pr 11 security")
-        self.assertEqual(self.vader.submit_pr.call_args.args[:2], ("11", ["security"]))
+        self.command("pr 42")
+        self.assertEqual(self.vader.submit_pr.call_args.args[:2], ("42", None))  # all six validators
+        self.command("pr 42 security")
+        self.assertEqual(self.vader.submit_pr.call_args.args[:2], ("42", ["security"]))
         self.command("pr")
         self.assertIn("Usage: `/vader pr", self.private[-1])
 
@@ -77,7 +77,7 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(self.private[-1], ":x: `x:1b` isn't in the allowed list")
 
     def test_a_mention_is_read_as_a_command(self):
-        self.assertEqual(bot.LEADING_MENTIONS.sub("", "<@U0VADER> <@U0OTHER> pr 11"), "pr 11")
+        self.assertEqual(bot.LEADING_MENTIONS.sub("", "<@U0VADER> <@U0OTHER> pr 42"), "pr 42")
 
 
 class EventTests(unittest.TestCase):

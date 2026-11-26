@@ -30,7 +30,8 @@ PROGRESS = ROOT / "bench_results" / "progress.json"  # the run so far, saved aft
 def ask(model: str, instructions: str, content: str,
         schema: dict = SCHEMA) -> tuple[list[dict] | None, int, float, int, bool]:
     """(findings, or None for a failed reply; findings dropped by the quote and weekday checks; seconds;
-    output tokens; whether it had to answer without thinking). Same checks and retry as a review."""
+    output tokens; whether it had to answer without thinking). The same checks as a review, and the same
+    retry without thinking; a reply that doesn't parse counts as failed (a review would ask again)."""
     start, think = time.time(), True
     try:
         try:
@@ -97,6 +98,7 @@ def bench_model(model: str, cases: list[dict], runs: int, stats: dict | None = N
         severe_enough = SEVERITIES[:SEVERITIES.index(case.get("min_severity", "info")) + 1]
         # Without a planted bug, anything more severe than this is a false alarm.
         too_severe = SEVERITIES[:SEVERITIES.index(case.get("worst_allowed", "info"))]
+
         def caught(findings):
             return bool(expect) and any(f.get("category") in expect and f["severity"] in severe_enough
                                         and (not words or says(f, words)) for f in findings)
@@ -155,7 +157,15 @@ def bench_model(model: str, cases: list[dict], runs: int, stats: dict | None = N
 
 
 def report(results: list[dict], runs: int) -> str:
-    mean = lambda xs: statistics.mean(xs) if xs else 0  # noqa: E731
+    def mean(xs):
+        return statistics.mean(xs) if xs else 0
+
+    def one(cs, k):  # per single ask
+        return f"{sum(c[k] for c in cs)}/{sum(c['tries'] for c in cs)}"
+
+    def many(cs, k, how):  # the asks combined, or filtered
+        return f"{sum(c[how][k] for c in cs if c.get(how))}/{sum(c[how]['tries'] for c in cs if c.get(how))}"
+
     lines = [f"# Vader model benchmark · {datetime.now():%Y-%m-%d %H:%M}", "",
              f"{runs} run(s) per case on {config.LLM_BASE_URL} ({config.MODEL_RUNTIME}). Speed is only meaningful "
              "on the target hardware. Output tokens/s includes reading the prompt; with a generic server the first "
@@ -179,12 +189,7 @@ def report(results: list[dict], runs: int) -> str:
         if both:
             planted = [c for c in both if c["planted"]]
             clean = [c for c in both if not c["planted"]]
-            one = lambda cs, k: f"{sum(c[k] for c in cs)}/{sum(c['tries'] for c in cs)}"  # noqa: E731
-
-            def many(cs, k, how):
-                return (f"{sum(c[how][k] for c in cs if c.get(how))}/"
-                        f"{sum(c[how]['tries'] for c in cs if c.get(how))}")
-            how = ("filtered (without the findings below high that most asks didn't report: Vader sends those to "
+            how =("filtered (without the findings below high that most asks didn't report: Vader sends those to "
                    "the verify pass, which isn't run here, so the truth is between this and combined)")
             lines += ["", f"**`{r['model']}`, asked several times ({r.get('asks')}), on the {len(both)} "
                           f"case(s) that used it:** bugs caught {one(planted, 'hits')} per single ask, "
@@ -204,9 +209,9 @@ def report(results: list[dict], runs: int) -> str:
     missed = [(r["model"], name, c["misses"]) for r in results for name, c in r["cases"].items() if c.get("misses")]
     if missed:
         lines += ["", "## What the model wrote on misses and false alarms", ""]
-        for model, name, runs in missed:
+        for model, name, misses in missed:
             lines.append(f"**`{model}` · {name}**")
-            for i, findings in enumerate(runs, 1):
+            for i, findings in enumerate(misses, 1):
                 lines += [f"- Miss {i}:"] + [f"  - {f}" for f in findings]
             lines.append("")
     return "\n".join(lines) + "\n"
@@ -245,11 +250,16 @@ def main() -> None:
         raise SystemExit(f"Not on the model server: {', '.join(missing)} (pull or download them there first)")
 
     PROGRESS.parent.mkdir(exist_ok=True)
-    progress = {"runs": args.runs, "results": {}}
+    # A resumed run must score its remaining cases the same way as the ones it already did
+    settings = {"runs": args.runs, "asks": args.asks, "only": args.only, "cases_file": args.cases_file}
+    progress = {**settings, "results": {}}
     if args.resume:
         saved = json.loads(PROGRESS.read_text(encoding="utf-8")) if PROGRESS.exists() else None
-        if not saved or saved["runs"] != args.runs:
-            raise SystemExit(f"No stopped run with --runs {args.runs} to resume ({PROGRESS} is missing or differs).")
+        if not saved:
+            raise SystemExit(f"No stopped run to resume ({PROGRESS} is missing).")
+        if changed := [f"--{k.replace('_', '-')}" for k in settings if saved.get(k) != settings[k]]:
+            raise SystemExit(f"The stopped run used different {', '.join(changed)}; resume with the same "
+                             f"settings: {', '.join(f'{k}={saved.get(k)!r}' for k in settings)}")
         progress["results"] = saved["results"]
         print(f"Resuming: {sum(len(r['cases']) for r in saved['results'].values())} case(s) already done")
 

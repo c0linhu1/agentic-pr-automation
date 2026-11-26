@@ -139,7 +139,7 @@ Set `AUTO_MERGE_BRANCH` in `.env.vader` to the branch PRs should be merged into,
 (empty = off). After a PR review, Vader merges the PR only when all of these hold, and otherwise says
 why it didn't (in the review's Slack thread and in the PR comment):
 
-- the verdict is PASS from all six validators (`/vader pr 18 security` never merges);
+- the verdict is PASS from all six validators (`/vader pr 42 security` never merges);
 - the PR is open, not a draft, and targets `AUTO_MERGE_BRANCH` (PRs into any other branch are never merged);
 - CI passed on the reviewed commit (re-read at merge time, since CI often finishes during the review);
 - nothing was pushed after the review: the merge is pinned to the reviewed commit, and a newer commit

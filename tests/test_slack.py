@@ -1,6 +1,9 @@
 import unittest
 
+import httpx
+
 from slack_bot import fmt
+from slack_bot.vader_client import VaderClient, VaderError
 
 
 class SlackTextTests(unittest.TestCase):
@@ -39,10 +42,10 @@ class SlackTextTests(unittest.TestCase):
         text = fmt.merge("conflict", "`<!channel>` has merge conflicts with `staging`.")
         self.assertTrue(text.startswith(":x: "))
         self.assertNotIn("<!channel>", text)
-        text = fmt.issue_closed({"repo": "o/r", "issue": 15, "title": "<!channel> bug", "pr": 16, "merged": True,
+        text = fmt.issue_closed({"repo": "o/r", "issue": 15, "title": "<!channel> bug", "pr": 40, "merged": True,
                                  "url": "https://github.com/o/r/issues/15"})
         self.assertIn("<https://github.com/o/r/issues/15|o/r#15>", text)
-        self.assertIn("PR #16 was merged", text)
+        self.assertIn("PR #40 was merged", text)
         self.assertNotIn("<!channel>", text)
 
     def test_findings_dropped_after_the_recheck_are_shown_with_the_reason(self):
@@ -71,6 +74,22 @@ class StatusTests(unittest.TestCase):
         self.assertIn("Auto-merge: PASS → `staging` · Closing linked issues: on",
                       self.status(loaded=[], auto_merge="staging", close_issues=True))
         self.assertIn("Auto-merge: off · Closing linked issues: off", self.status(loaded=[]))
+
+
+class VaderClientTests(unittest.TestCase):
+    def client(self, reply: httpx.Response) -> VaderClient:
+        c = VaderClient("http://vader", "k")
+        c._http = httpx.Client(base_url="http://vader", transport=httpx.MockTransport(lambda request: reply))
+        return c
+
+    def test_any_reply_it_cant_read_is_an_error_to_show_not_a_crash(self):
+        for reply, says in [(httpx.Response(409, json={"detail": "Vader is stopped"}), "Vader is stopped"),
+                            (httpx.Response(502, text="Bad Gateway"), "Bad Gateway"),
+                            (httpx.Response(500, json=["not", "an", "object"]), "not"),
+                            (httpx.Response(200, text="<html>proxy</html>"), "can't read")]:
+            with self.subTest(status=reply.status_code), self.assertRaisesRegex(VaderError, says):
+                self.client(reply).status()
+        self.assertEqual(self.client(httpx.Response(200, json={"enabled": True})).status(), {"enabled": True})
 
 
 if __name__ == "__main__":

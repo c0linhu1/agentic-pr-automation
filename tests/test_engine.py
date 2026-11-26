@@ -31,6 +31,14 @@ class EngineTests(EngineCase):
         self.assertEqual(self.loaded, ["fake:1b", "b:1b", "b:1b", "fake:1b"])
         self.assertEqual([r["validator"] for r in second.results], ["qa", "security"])
 
+    def test_a_switch_records_the_model_it_loaded_so_the_next_review_starts_there(self):
+        engine = self.engine()
+        engine.preload("b:1b", lambda m: None)
+        self.assertEqual(engine._last_model, "b:1b")
+        with self.assertRaises(RuntimeError):
+            engine.preload("c:1b", mock.Mock(side_effect=RuntimeError("isn't pulled")))
+        self.assertIsNone(engine._last_model)  # nothing known to be loaded
+
     def test_finished_review_releases_its_diff(self):
         review = self.finish(Review(source="slack", validators=["qa"], diff="+x" * 1000))
         self.assertEqual((review.diff, review._parts), ("", []))
@@ -124,10 +132,26 @@ class EngineTests(EngineCase):
         result, = review.results
         self.assertEqual(result["status"], "ok")  # one unusable ask out of three still counts as reviewed
         self.assertEqual(verified, ["seen once, real", "seen once, made up"])  # agreed ones and highs aren't
-        self.assertEqual([f["description"] for f in result["findings"]],
-                         ["rare high", "seen twice", "seen twice, two lines on", "seen once, real"])
-        self.assertFalse({"_ask", "_verify"} & set(result["findings"][3]))
+        # the two asks' copies of "seen twice" are one finding, in the first copy's words
+        self.assertEqual([f["description"] for f in result["findings"]], ["rare high", "seen twice", "seen once, real"])
+        self.assertFalse({"_ask", "_verify"} & set(result["findings"][2]))
         self.assertEqual([x["description"] for x in result["rejected"]], ["seen once, made up"])
+
+    def test_two_findings_from_one_ask_are_never_merged(self):
+        def f(description, line):
+            return {"severity": "medium", "category": "logic", "description": description, "file": "a.py", "line": line}
+        replies = iter([{"findings": [f("off by one", 20), f("null check", 23)]},
+                        {"findings": [f("null check, again", 22), f("off by one, again", 19)]},
+                        {"findings": []}])
+
+        def complete(model, instructions, content, **kw):
+            return json.dumps(next(replies))
+
+        with mock.patch.object(config, "VALIDATOR_ASKS", {"correctness": 3}):
+            review = self.finish(Review(source="slack", validators=["correctness"], diff="+x"), complete=complete)
+        # 3 lines apart, but both from the first ask, so both kept. Line 22 could join either and joins the
+        # closer one (23); had it taken 20, line 19 would have nothing left to join and show up a third time.
+        self.assertEqual([f["description"] for f in review.results[0]["findings"]], ["off by one", "null check"])
 
     def test_each_validator_can_only_use_its_own_skills_categories(self):
         schemas = {}

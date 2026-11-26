@@ -13,6 +13,8 @@ from . import config
 
 TIMEOUT = httpx.Timeout(10.0, read=600.0)  # loading a large model can take minutes
 LOAD_ATTEMPTS = 2
+EFFORT_LEVELS = ("low", "medium", "high")
+DEFAULT_TEMPERATURE = 0.1
 
 
 class ModelServerDown(Exception):
@@ -50,10 +52,6 @@ def catalog() -> tuple[str | None, list[ModelEntry]]:
     return (normalize(default) if default else None), entries
 
 
-EFFORT_LEVELS = ("low", "medium", "high")
-DEFAULT_TEMPERATURE = 0.1
-
-
 def _entry(name: str) -> dict:
     name = normalize(name)
     return next((m for m in _read().get("models", []) if normalize(str(m.get("name", ""))) == name), {})
@@ -67,7 +65,7 @@ def reasoning_effort(name: str) -> str | None:
 
 
 def temperature(name: str) -> float:
-    """A model's `temperature:` from models.yaml, else 0.1. Thinking models want what their makers
+    """A model's `temperature:` from models.yaml, else DEFAULT_TEMPERATURE. Thinking models want what their makers
     recommend: near 0 they can reason in circles until they run out of reply space."""
     try:
         return float(_entry(name).get("temperature", DEFAULT_TEMPERATURE))
@@ -94,17 +92,17 @@ def available() -> set[str] | None:
 
 def loaded() -> list[dict] | None:
     """Models in memory: [{name, size_gb, vram_gb, context}], or None when that's unknown (a generic
-    server doesn't say, or Ollama can't be reached)."""
+    server doesn't say, or Ollama can't be reached or gives a reply that can't be read)."""
     if not _ollama():
         return None
     try:
         r = httpx.get(f"{config.OLLAMA_URL}/api/ps", timeout=5)
         r.raise_for_status()
-    except httpx.HTTPError:
+        return [{"name": m["name"], "size_gb": round(m.get("size", 0) / 1e9, 1),
+                 "vram_gb": round(m.get("size_vram", 0) / 1e9, 1), "context": m.get("context_length")}
+                for m in r.json().get("models", [])]
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
         return None
-    return [{"name": m["name"], "size_gb": round(m.get("size", 0) / 1e9, 1),
-             "vram_gb": round(m.get("size_vram", 0) / 1e9, 1), "context": m.get("context_length")}
-            for m in r.json().get("models", [])]
 
 
 def unload(name: str) -> None:

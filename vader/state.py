@@ -18,7 +18,10 @@ class State:
         self._lock = threading.Lock()
         self._data = dict(DEFAULTS, reviewed={}, issues_synced={}, held={})
         if path.exists():
-            self._data.update(json.loads(path.read_text(encoding="utf-8")))
+            try:
+                self._data.update(json.loads(path.read_text(encoding="utf-8")))
+            except (ValueError, TypeError) as e:  # only a hand edit can break it: it's written atomically
+                raise SystemExit(f"{path} isn't valid JSON ({e}); fix it, or delete it to start fresh") from None
         if not self._data["model"]:
             self._data["model"] = default_model
 
@@ -29,6 +32,8 @@ class State:
             return self._data[key]
 
     def set(self, **changes) -> None:
+        if unknown := set(changes) - set(DEFAULTS):
+            raise KeyError(f"not a state setting: {', '.join(sorted(unknown))}")
         with self._lock:
             self._data.update(changes)
             self._save()

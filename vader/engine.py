@@ -14,10 +14,10 @@ from dataclasses import dataclass, field, fields
 from typing import Callable
 
 from . import config, llm, models
-from .agents import VALIDATORS
-from .decision import decide
+from .agents import VALIDATORS, Validator
+from .decision import BLOCK, HOLD, decide
 from .diffs import FileDiff, pack, pack_with_context, split_files
-from .findings import SEVERITIES, VERIFY_SCHEMA, agreed, code_lines, ground, parse_findings
+from .findings import SEVERITIES, VERIFY_SCHEMA, agreed, code_lines, ground, merge_asks, parse_findings
 from .skips import filter_files
 from .state import State
 
@@ -83,11 +83,11 @@ class Review:
     _calls_done: int = field(default=0, repr=False)
     _served: bool = field(default=False, repr=False)  # the model server answered at least once
     _server_down: bool = field(default=False, repr=False)  # a load or call found it unreachable
-    _code: dict | None = field(default=None, repr=False)  # path -> its lines as shown, for checking quotes
+    _code: dict = field(default_factory=dict, repr=False)  # path -> its lines as shown, for checking quotes
 
     @property
     def ci_status(self) -> str | None:
-        """"passed", "failed", or None (no CI results, or still running)."""
+        """passed, failed, or None (no CI results, or still running)."""
         if not self.ci or any(c["status"] != "completed" for c in self.ci):
             return None
         bad = {"failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"}
@@ -122,9 +122,7 @@ class Review:
                          + ", ".join(s["path"] for s in self.skipped_files[:30]))
         return "\n\n".join(x for x in lines if x)
 
-    def prompt(self, part: int | None = None) -> str:
-        if not self._parts:
-            return "\n\n".join(x for x in [self.header(), f"DIFF:\n{self.diff}"] if x)
+    def prompt(self, part: int) -> str:
         note = ""
         if self.parts > 1:
             note = (f"NOTE: this PR is too large to review at once, so it is split into {self.parts} parts. This "
@@ -183,6 +181,7 @@ class Engine:
         self._reviews: dict[str, Review] = {}  # insertion order = oldest first
         self._running: Review | None = None
         self._last_model: str | None = None  # the model left loaded by the previous review
+        self._model_lock = threading.Lock()  # held for a whole review, and by preload, so loads never overlap
         self._cv = threading.Condition()
         self._thread = threading.Thread(target=self._work, name="vader-worker", daemon=True)
 
@@ -249,7 +248,19 @@ class Engine:
                     self._cv.wait(timeout=5)
                 review = self._queue.popleft()
                 self._running = review
-            self._process(review)
+            with self._model_lock:
+                self._process(review)
+
+    def preload(self, model: str, load: Callable[[str], None]) -> None:
+        """Load a model outside a review (a model switch). It waits for a running review, and the next review
+        waits for it: with Ollama, overlapping loads would unload each other's model mid-review."""
+        with self._model_lock:
+            try:
+                load(model)
+            except Exception:
+                self._last_model = None  # the old model may already be unloaded
+                raise
+            self._last_model = model
 
     def _process(self, review: Review) -> None:
         """Run one review to the end whatever happens, then hand it to on_done."""
@@ -257,11 +268,8 @@ class Engine:
             self._run(review)
         except Exception:  # noqa: BLE001 - the worker must survive anything
             log.exception("review %s crashed", review.id)
-            review.verdict, review.verdict_reason = "HOLD", "Vader crashed during the review; see its log"
-            review.status, review.finished = "done", time.time()
-            review.diff, review.context, review._parts, review._code = "", {}, [], None
-            self._mark_reviewed(review)  # so the poller doesn't requeue it
-            self.events.add("review_done", review=review.summary())
+            review.verdict, review.verdict_reason = HOLD, "Vader crashed during the review; see its log"
+            self._finish(review)
         finally:
             with self._cv:
                 self._running = None
@@ -287,15 +295,22 @@ class Engine:
         def split() -> list[list[FileDiff]]:
             if not kept:
                 return []
-            if review.context:
-                return pack_with_context(kept, review.context, budget())
-            return pack(kept, budget())
+            return pack_with_context(kept, review.context, budget()) if review.context else pack(kept, budget())
 
         review._parts = split()
         review.parts = max(len(review._parts), 1)
         if review.parts > 1:  # leave room for the file list a split PR's header adds
             review._parts = split()
             review.parts = len(review._parts)
+
+        # Each file's lines as the validators see them, for checking the quotes in findings
+        shown: dict[str, list[str]] = {}
+        for part in review._parts:
+            for f in part:
+                texts = shown.setdefault(f.path, ["", ""])
+                texts[0] += f.text + "\n"
+                texts[1] = texts[1] or f.context
+        review._code = {path: code_lines(diff, context) for path, (diff, context) in shown.items()}
 
     def _deadline(self, review: Review) -> float | None:
         minutes = config.REVIEW_TIME_LIMIT_MINUTES
@@ -320,10 +335,10 @@ class Engine:
         # Start with the model the previous review left loaded, so it isn't swapped out and back.
         order = sorted(groups, key=lambda m: m != self._last_model)
 
+        deadline = self._deadline(review)
         for model in order:
             keys = groups[model]
             load_error = None
-            deadline = self._deadline(review)
             if not review._parts:
                 load_error = "nothing to review: every file was generated, a lockfile, or binary"
             elif deadline and time.time() > deadline:
@@ -350,22 +365,24 @@ class Engine:
         review.unavailable = bool(review._parts) and review._server_down and not review._served
         if review.unavailable:
             review.verdict_reason += "; Vader couldn't reach the model server, so nothing was reviewed"
+        self._finish(review)
+
+    def _finish(self, review: Review) -> None:
         review.status, review.finished = "done", time.time()
-        review.diff, review.context, review._parts, review._code = "", {}, [], None  # free the code
-        self._mark_reviewed(review)
+        review.diff, review.context, review._parts, review._code = "", {}, [], {}  # free the code
+        self._mark_reviewed(review)  # also after a crash, so the poller doesn't requeue it
         self.events.add("review_done", review=review.summary())
 
     def _mark_reviewed(self, review: Review) -> None:
-        """Record the PR commit so the poller skips it; only reviews by all six validators count. A commit
-        held or blocked for its findings (not just for a validator that didn't finish) is also recorded, so a
-        later PASS of the same commit isn't merged without a person."""
+        """Record the PR commit so the poller skips it (only reviews by all six validators count). A commit
+        held or blocked for its findings is also recorded as held, so a later PASS of it isn't merged."""
         key = review.meta.get("pr_key")
         if not key or review.unavailable:
             return
         if set(review.validators) == set(VALIDATORS):
             self.state.mark_reviewed(key, review.meta["sha"])
         serious = [f for r in review.results for f in r["findings"] if f["severity"] in ("critical", "high")]
-        if review.verdict in ("BLOCK", "HOLD") and serious:
+        if review.verdict in (BLOCK, HOLD) and serious:
             self.state.mark_held(key, review.meta["sha"],
                                  f"{review.verdict}: " + "; ".join(f["description"][:150] for f in serious[:3]))
 
@@ -429,13 +446,13 @@ class Engine:
     def _report(self, review: Review, run: dict) -> None:
         result = run["result"]
         grounded, unquoted = self._ground(review, run["findings"])
-        agreeing = agreed(grounded, asks(result["validator"]))
-        merged, rejected = self._verify(result["model"], review, merge_findings(agreeing))
+        n = asks(result["validator"])
+        combined = merge_asks(agreed(grounded, n)) if n > 1 else grounded  # agreed counts the copies first
+        merged, rejected = self._verify(result["model"], review, merge_findings(combined))
         result["rejected"] = unquoted + rejected
         for f in merged:
-            f.pop("_part", None)
-            f.pop("_ask", None)
-            f.pop("_verify", None)
+            for tag in ("_part", "_ask", "_verify"):
+                f.pop(tag, None)
         result["findings"], result["omitted"] = merged[:MAX_FINDINGS], max(len(merged) - MAX_FINDINGS, 0)
         if result["parts_done"] == review.parts:
             result["status"], result["error"] = "ok", None
@@ -449,14 +466,6 @@ class Engine:
     def _ground(self, review: Review, findings: list[dict]) -> tuple[list[dict], list[dict]]:
         """Drop findings that quote code the validator wasn't shown, and take each kept finding's file and
         line from where its quote is. Returns (kept, dropped)."""
-        if review._code is None:
-            shown: dict[str, list[str]] = {}
-            for part in review._parts:
-                for f in part:
-                    texts = shown.setdefault(f.path, ["", ""])
-                    texts[0] += f.text + "\n"
-                    texts[1] = texts[1] or f.context
-            review._code = {path: code_lines(diff, context) for path, (diff, context) in shown.items()}
         kept, dropped = [], []
         pr_text = "\n".join([review.title, review.ticket, review.description])
         for f in findings:
@@ -497,7 +506,7 @@ class Engine:
                      time.time() - start)
         return kept, rejected
 
-    def _ask(self, model: str, v, review: Review, part: int, run: dict | None = None):
+    def _ask(self, model: str, v: Validator, review: Review, part: int, run: dict):
         """One model call for one part, parsed; re-asked PARSE_RETRIES times if unusable (each bad
         reply is saved to FAILED_REPLIES_DIR). A model that thinks until it runs out of reply space is
         asked once more without thinking: a quicker, shallower answer is evidence, a failure isn't."""
@@ -508,9 +517,8 @@ class Engine:
             except llm.OutputLimit as e:
                 log.warning("%s on %s: %s; asking again without thinking", v.key, model, e)
                 raw = self._complete(model, instructions, review.prompt(part), schema=schema, think=False)
-                if run is not None:
-                    run["result"]["note"] = ("answered without thinking: it ran out of reply space while thinking, "
-                                             "so this check is shallower")
+                run["result"]["note"] = ("answered without thinking: it ran out of reply space while thinking, "
+                                         "so this check is shallower")
             parsed = parse_findings(raw)
             if not parsed.failure:
                 return parsed
@@ -526,7 +534,8 @@ class Engine:
             return
         try:
             config.FAILED_REPLIES_DIR.mkdir(parents=True, exist_ok=True)
-            path = config.FAILED_REPLIES_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{review.id}-{key}-p{part + 1}-a{attempt + 1}.txt"
+            name = f"{time.strftime('%Y%m%d-%H%M%S')}-{review.id}-{key}-p{part + 1}-a{attempt + 1}.txt"
+            path = config.FAILED_REPLIES_DIR / name
             path.write_text(f"model: {model}\nreason: {why}\nreview: {review.title}\n\n{raw}", encoding="utf-8")
         except OSError:
             log.exception("couldn't save the failed reply")

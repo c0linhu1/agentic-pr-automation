@@ -79,11 +79,19 @@ COMPILED_JS_MARKERS = ("sourcemappingurl=", 'object.defineproperty(exports, "__e
 FILE_START = re.compile(r"^@@ -\d+(?:,\d+)? \+1(?:,\d+)? @@.*\n((?:[ +].*\n?){1,5})", re.M)
 
 
+def _path(path: str) -> PurePosixPath:
+    """A path as the skip rules compare it: forward slashes, lower case."""
+    return PurePosixPath(path.replace("\\", "/").lower())
+
+
+def _is_binary(text: str) -> bool:
+    return "Binary files " in text[:2000] or "GIT binary patch" in text[:2000]
+
+
 def skip_reason(f: FileDiff, ts_stems: set[str], names: set[str] = frozenset()) -> str | None:
     """Why this file shouldn't be reviewed, or None to review it. `names`: every file name in the change."""
-    path = f.path.replace("\\", "/")
-    lower = path.lower()
-    p = PurePosixPath(lower)
+    p = _path(f.path)
+    lower = str(p)
     if p.name in LOCKFILES:  # before the binary check: a binary lockfile (bun.lockb) can't be checked
         return _lockfile_reason(p.name, f.text, names)
     if p.suffix in KEY_EXT:
@@ -92,7 +100,7 @@ def skip_reason(f: FileDiff, ts_stems: set[str], names: set[str] = frozenset()) 
         return "executable or archive"
     if p.suffix in INERT_EXT:
         return "image, font or document"
-    if "Binary files " in f.text[:2000] or "GIT binary patch" in f.text[:2000]:
+    if _is_binary(f.text):
         return "binary of an unknown type"
     if p.suffix == ".map":
         return "source map"
@@ -128,7 +136,7 @@ def _lockfile_reason(name: str, text: str, names: set[str]) -> str:
     manifests = LOCKFILE_MANIFESTS[name]
     if not any(n in manifests or n.endswith(tuple(m for m in manifests if m.startswith("."))) for n in names):
         return f"lockfile changed without {manifests[0]}"
-    if name in UNCHECKABLE_LOCKFILES or "Binary files " in text[:2000] or "GIT binary patch" in text[:2000]:
+    if name in UNCHECKABLE_LOCKFILES or _is_binary(text):
         return "lockfile in a format Vader can't check"
     trusted = PACKAGE_HOSTS | config.TRUSTED_PACKAGE_HOSTS
     lines = DOWNLOAD_LINE_WITH_URL if name in URL_KEY_LOCKFILES else DOWNLOAD_LINE
@@ -154,8 +162,8 @@ def generated_source_changed(path: str, reviewed: set[str]) -> bool:
     """A file the generator makes this one from was changed in the change and reviewed: the migration next
     to X.Designer.cs (X.cs), user.dart for user.g.dart, a .proto for protobuf output, a migration in the
     folder for a model snapshot. A new generated file without one could be hand-written under a fake banner."""
-    p = PurePosixPath(path.replace("\\", "/").lower())
-    sources = [PurePosixPath(r.replace("\\", "/").lower()) for r in reviewed]
+    p = _path(path)
+    sources = [_path(r) for r in reviewed]
     if p.name.endswith("modelsnapshot.cs"):
         return any(s.parent == p.parent for s in sources)
     suffix = next((s for s in GENERATED_SUFFIXES if p.name.endswith(s)), "")
@@ -204,8 +212,8 @@ def needs_person(paths: list[str], globs: list[str]) -> list[str]:
 
 def filter_files(files: list[FileDiff]) -> tuple[list[FileDiff], list[dict]]:
     """(files to review, [{"path", "reason"}] for the ones dropped)."""
-    ts_stems = {PurePosixPath(f.path.lower()).stem for f in files if f.path.lower().endswith(TS_SOURCE)}
-    names = {PurePosixPath(f.path.replace("\\", "/").lower()).name for f in files}
+    ts_stems = {_path(f.path).stem for f in files if f.path.lower().endswith(TS_SOURCE)}
+    names = {_path(f.path).name for f in files}
     kept, skipped = [], []
     for f in files:
         reason = skip_reason(f, ts_stems, names)
